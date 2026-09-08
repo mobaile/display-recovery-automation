@@ -74,6 +74,38 @@ dist/display-recovery-cli export-log
 
 日志位于 `~/Library/Logs/DisplayRecoveryAutomation/recovery.log`。记录事务、阶段、尝试次数与收尾责任，写入前脱敏 IP 和 Token，合并重复消息，超过 2 MB 轮转；导出包含当前和上一份日志。
 
+## 登录后自动恢复
+
+日常运行的固定安装位置是 `/Applications/DisplayRecoveryAutomation.app`。macOS 原生登录项指向这个安装包；`dist/` 保留构建产物，更新后需要同步安装包。
+
+自动恢复需要同时启用两项设置：
+
+1. 在 macOS「系统设置 → 通用 → 登录项与扩展 → 登录时打开」中登记上述固定路径，同一路径只保留一条，移除本项目旧 `dist/` 路径的登录项。
+2. 在应用菜单栏「双屏」中勾选「自动恢复」。该开关会保存到 `~/Library/Application Support/DisplayRecoveryAutomation/config.json` 的 `recovery.automaticRecoveryEnabled`。
+
+登录 macOS 后，应用自动在菜单栏运行，先经过 10 秒启动观察期；确认同一单屏状态持续 5 秒、目标身份和设备通信满足预检查后，按现有规则尝试恢复。设备就绪和通信耗时可能延长等待，不能将 15 秒理解为恢复完成期限。睡眠唤醒后同样重新观察，正常双屏保留用户手动模式。同一故障仍最多尝试三次，每次结束后冷却 30 秒；恢复成功仍须确认双屏在线、MSI 硬件 UHD、系统 4K，并连续稳定 10 秒。
+
+该设置从用户登录后生效，不覆盖 FileVault 解锁前。2026-09-08 已在本机完成安装、唯一登录项登记和自动恢复启用；配置与运行检查见 [验收记录](docs/verification-20260908.md)。
+
+### 验证与关闭
+
+以下只读检查的预期输出分别为 `1` 和 `true`：
+
+```sh
+/usr/bin/osascript -e 'tell application "System Events" to count (every login item whose path is "/Applications/DisplayRecoveryAutomation.app")'
+/usr/bin/plutil -extract recovery.automaticRecoveryEnabled raw -o - "$HOME/Library/Application Support/DisplayRecoveryAutomation/config.json"
+```
+
+同时核对进程只运行一份，且可执行文件位于 `/Applications/DisplayRecoveryAutomation.app/Contents/MacOS/DisplayRecoveryApp`。应用启动日志和后续观测位于前述 `recovery.log`。手动启动验证只能证明安装包可以运行，真实登录自启动应在下一次正常登录时结合进程启动时间及日志核实。
+
+关闭「自动恢复」会停止新恢复并取消当前恢复、执行有限收尾；从系统登录项移除应用会停止后续登录自启动，但不会退出已运行的实例。菜单栏「退出」只结束本次运行，下次登录仍会按已登记的登录项启动。彻底停用时应关闭自动恢复、移除登录项，再正常退出。
+
+### 更新安装包
+
+按前述构建命令生成并校验新的 `dist/DisplayRecoveryAutomation.app`。确认当前没有未完成恢复责任后，通过菜单栏正常退出旧实例，备份并完整替换 `/Applications/DisplayRecoveryAutomation.app`，然后从固定安装路径重新启动。更新失败时恢复旧安装包。
+
+应用配置、凭据与恢复事务保存在用户的 Application Support 目录，更新时保留这些文件。安装路径不变时沿用原登录项，更新后再次核对唯一登录项、自动恢复开关和实际进程路径，避免继续运行旧版本或同时启动 `dist/` 里的副本。
+
 ## 验证范围
 
 本次修复的测试结果、实机经过及未覆盖情形见 [2026-09-08 验收记录](docs/verification-20260908.md)。
