@@ -2,6 +2,17 @@ import XCTest
 @testable import DisplayRecoveryCore
 
 final class ModelsTests: XCTestCase {
+    func testLegacyTimeoutsGetMinimumHoldDefaults() throws {
+        let old = Data(#"{"powerOff":15,"newDisplayOnline":20,"safeMode":20,"powerOn":15,"oldDisplayOnline":30,"restoreMode":30}"#.utf8)
+        let timeouts = try JSONDecoder().decode(RecoveryTimeouts.self, from: old)
+        XCTAssertEqual(timeouts.powerOffMinimum, 10)
+        XCTAssertEqual(timeouts.powerOnSettle, 15)
+        XCTAssertEqual(timeouts.modeSettle, 15)
+        XCTAssertEqual(timeouts.hardwareReady, 15)
+        XCTAssertEqual(timeouts.singleDisplayObserve, 10)
+        XCTAssertEqual(timeouts.newDisplayOnline, 20, "旧配置的显式期限保持兼容，部署时按本机方案迁移")
+        XCTAssertEqual(try JSONDecoder().decode(RecoveryTimeouts.self, from: JSONEncoder().encode(timeouts)), timeouts)
+    }
     func testModeSignatureFormattingAndTolerance() {
         let mode = DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144)
         XCTAssertEqual(mode.shortDescription, "3840×2160 @ 144Hz")

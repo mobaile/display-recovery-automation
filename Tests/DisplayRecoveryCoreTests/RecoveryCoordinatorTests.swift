@@ -11,12 +11,162 @@ private func msi(_ mode: DisplayModeSignature? = uhd) -> DisplaySnapshot { Displ
 private func configuration(automatic: Bool = true) -> RecoveryConfiguration {
     RecoveryConfiguration(roles: DisplayRoleConfiguration(powerControlled: antFingerprint, modeSwitch: msiFingerprint),
         recoveryCooldown: 0, pollInterval: 0.5,
-        timeouts: RecoveryTimeouts(powerOff: 2, newDisplayOnline: 2, safeMode: 2, powerOn: 2, oldDisplayOnline: 2, restoreMode: 2, dualDisplayStabilize: 10, singleDisplayObserve: 5),
+        timeouts: RecoveryTimeouts(powerOff: 15, newDisplayOnline: 15, safeMode: 20, powerOn: 15, oldDisplayOnline: 30, restoreMode: 30, dualDisplayStabilize: 10, singleDisplayObserve: 5),
         automaticRecoveryEnabled: automatic)
 }
 private var target: RecoveryTarget { RecoveryTarget(roles: configuration().roles, controlIdentity: "plug-fixture") }
 
 final class RecoveryCoordinatorTests: XCTestCase {
+    func testEveryControlActionKeepsMinimumIntervalDespiteImmediateReplies() async throws {
+        let h = Harness(snapshots: [ant()])
+        await h.io.setRevealANTOnPower(false)
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(outcome, .success)
+        let calls = await h.io.writes
+        let times = await h.io.writeTimes
+        XCTAssertEqual(calls, ["power:false", "power:true", "mode:FHD", "mode:UHD"])
+        XCTAssertEqual(times.count, 4)
+        guard times.count == 4 else { return }
+        XCTAssertGreaterThanOrEqual(times[1] - times[0], 10)
+        XCTAssertGreaterThanOrEqual(times[2] - times[1], 15)
+        XCTAssertGreaterThanOrEqual(times[3] - times[2], 15)
+        XCTAssertGreaterThanOrEqual(h.clock.monotonicNow - times[3], 15)
+    }
+
+    func testAlreadyUHDStillGetsModeObservationWindowBeforeSuccess() async {
+        let h = Harness(snapshots: [ant(), msi()])
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(outcome, .success)
+        XCTAssertGreaterThanOrEqual(h.clock.monotonicNow, 15)
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty, "已是 UHD 时不应重复写入模式")
+    }
+
+    func testMSIReturnsAtFourteenSecondsWhileANTEnumerationRemains() async {
+        let h = Harness(snapshots: [ant()])
+        await h.io.setHardwareUnavailable(true)
+        await h.io.configurePowerOff(retainANT: true, msiDelay: 14, restoresHID: true)
+        let result = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        let times = await h.io.writeTimes
+        XCTAssertEqual(result, .success)
+        XCTAssertEqual(calls, ["power:false", "power:true"])
+        XCTAssertEqual(times.last.map { $0 - times[0] }, 14)
+    }
+
+    func testMSIOnlyReturnsAfterPowerOnAndGetsFullSettlingWindow() async {
+        let h = Harness(snapshots: [ant()])
+        await h.io.setHardwareUnavailable(true)
+        await h.io.configurePowerOff(retainANT: true, msiDelay: nil, restoresHID: true)
+        await h.io.setMSIDelayAfterPowerOn(12)
+        let result = await h.coordinator.triggerManualRecovery()
+        let times = await h.io.writeTimes
+        XCTAssertEqual(result, .success)
+        XCTAssertEqual(times.count, 2)
+        XCTAssertEqual(times.last.map { $0 - times[0] }, 15)
+    }
+
+    func testMissingMSIAfterBothWindowsRestoresPowerAndDoesNotClaimSuccess() async throws {
+        let h = Harness(snapshots: [ant()])
+        await h.io.setHardwareUnavailable(true)
+        await h.io.configurePowerOff(retainANT: true, msiDelay: nil)
+        let result = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        let times = await h.io.writeTimes
+        let saved = try await h.store.load()
+        XCTAssertNotEqual(result, .success)
+        XCTAssertEqual(calls, ["power:false", "power:true"])
+        XCTAssertEqual(times.last.map { $0 - times[0] }, 15)
+        XCTAssertFalse(saved?.powerPendingRestore ?? true)
+        XCTAssertTrue(saved?.modePending4K == true)
+        XCTAssertFalse(saved?.modeCleanupUsed ?? true)
+    }
+
+    func testPendingCleanupWaitsForTemporaryHIDOutage() async throws {
+        let tx = RecoveryTransaction(attemptCount: 1, modePending4K: true, target: target, msiHIDIdentity: "msi-usb-fixture")
+        let h = Harness(snapshots: [ant(), msi(fhd)], hardware: .fhd, transaction: tx)
+        await h.io.setHIDAvailableAt(27)
+        let result = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        let times = await h.io.writeTimes
+        XCTAssertEqual(result, .success)
+        XCTAssertEqual(calls, ["mode:UHD"])
+        XCTAssertEqual(times.first, 27)
+    }
+
+    func testUnavailableHIDDoesNotFalselyReportUsedCleanupBudget() async throws {
+        let tx = RecoveryTransaction(attemptCount: 1, modePending4K: true, target: target)
+        let h = Harness(snapshots: [ant(), msi()], transaction: tx)
+        await h.io.setHardwareUnavailable(true)
+        let result = await h.coordinator.triggerManualRecovery()
+        let saved = try await h.store.load()
+        guard case .stopped(let reason) = result else { return XCTFail("应保留未完成责任") }
+        XCTAssertTrue(reason.contains("额度未使用"))
+        XCTAssertFalse(reason.contains("额度已使用"))
+        XCTAssertFalse(saved?.modeCleanupUsed ?? true)
+        XCTAssertEqual(h.clock.monotonicNow, 30, "接续观察 15 秒，加 HID 就绪窗口 15 秒")
+    }
+
+    func testManualPendingANTRecoveryPreservesTransactionAndTarget() async throws {
+        let tx = RecoveryTransaction(attemptCount: 3, isStopped: true, modePending4K: true, target: target,
+                                     msiHIDIdentity: "msi-usb-fixture")
+        let h = Harness(snapshots: [ant()], transaction: tx)
+        await h.io.setHardwareUnavailable(true)
+        await h.io.configurePowerOff(retainANT: true, msiDelay: 12, restoresHID: true)
+        let result = await h.coordinator.triggerManualRecovery()
+        let saved = try await h.store.load()
+        let calls = await h.io.writes
+        XCTAssertEqual(result, .success)
+        XCTAssertEqual(calls, ["power:false", "power:true"])
+        XCTAssertEqual(saved?.id, tx.id)
+        XCTAssertEqual(saved?.target, tx.target)
+        XCTAssertEqual(saved?.msiHIDIdentity, tx.msiHIDIdentity)
+        XCTAssertFalse(saved?.hasPendingCleanup ?? true)
+        XCTAssertEqual(saved?.attemptCount, 0)
+    }
+
+    func testAutomaticPendingANTDoesNotRestartPowerCycle() async {
+        let tx = RecoveryTransaction(attemptCount: 1, modePending4K: true, target: target)
+        let h = Harness(snapshots: [ant()], transaction: tx)
+        await h.io.setHardwareUnavailable(true)
+        _ = await h.coordinator.evaluateAndRecover()
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testLostModeAcknowledgementStillKeepsIntervalBeforeCleanup() async throws {
+        let h = Harness()
+        await h.io.setFailAfterFHDWrite(true)
+        let result = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        let times = await h.io.writeTimes
+        XCTAssertNotEqual(result, .success)
+        XCTAssertEqual(calls, ["mode:FHD", "mode:UHD"])
+        XCTAssertGreaterThanOrEqual(times.last.map { $0 - times[0] } ?? 0, 15)
+    }
+
+    func testModeReenumerationDelayDoesNotConsumeMinimumHoldTime() async {
+        let h = Harness()
+        await h.io.setModeHIDOutage(12)
+        let result = await h.coordinator.triggerManualRecovery()
+        let times = await h.io.writeTimes
+        XCTAssertEqual(result, .success)
+        XCTAssertGreaterThanOrEqual(times.last.map { $0 - times[0] } ?? 0, 27)
+        XCTAssertGreaterThanOrEqual(h.clock.monotonicNow - (times.last ?? 0), 27)
+    }
+
+    func testCancellationAfterPowerOffKeepsTenSecondsBeforeRestore() async throws {
+        let h = Harness(snapshots: [ant()])
+        await h.io.setCancelAfterPowerOff(true)
+        let result = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        let times = await h.io.writeTimes
+        guard case .cancelled = result else { return XCTFail("必须报告取消") }
+        XCTAssertEqual(calls, ["power:false", "power:true"])
+        XCTAssertGreaterThanOrEqual(times.last.map { $0 - times[0] } ?? 0, 10)
+        let saved = try await h.store.load()
+        XCTAssertFalse(saved?.hasPendingCleanup ?? true)
+    }
     func testFailedCompletionCommitCannotEraseThirdAttempt() async throws {
         let h = Harness(transaction: RecoveryTransaction(attemptCount: 2))
         await h.store.setFailStage(.completed)
@@ -323,6 +473,8 @@ final class RecoveryCoordinatorTests: XCTestCase {
         let calls = await h.io.writes
         let tx = try await h.store.load()
         XCTAssertEqual(calls, ["mode:FHD", "mode:UHD"])
+        let times = await h.io.writeTimes
+        XCTAssertGreaterThanOrEqual(times.last.map { $0 - times[0] } ?? 0, 15)
         XCTAssertFalse(tx?.hasPendingCleanup ?? true)
     }
     func testPowerCleanupFailureDoesNotSuppressUHD() async throws {
@@ -461,6 +613,7 @@ private actor TestIO: RecoveryIO {
     private(set) var hardware: MsiHardwareDualMode
     private var power: Bool
     private(set) var writes: [String] = []
+    private(set) var writeTimes: [TimeInterval] = []
     private var revealANTOnPower = true
     private var revealANTOnFHD = true
     private var revealANTOnUHD = false
@@ -473,10 +626,38 @@ private actor TestIO: RecoveryIO {
     private var observationAge: TimeInterval = 0
     private var powerReadDelay: TimeInterval = 0
     private var gate: TestGate?
+    private var retainANTWhenOff = false
+    private var msiDelayAfterPowerOff: TimeInterval? = 0
+    private var msiDelayAfterPowerOn: TimeInterval?
+    private var pendingMSIAt: TimeInterval?
+    private var restoresHIDWithMSI = false
+    private var hidAvailableAt: TimeInterval?
+    private var modeHIDOutage: TimeInterval = 0
+    private var failAfterFHDWrite = false
+    private var cancelAfterPowerOff = false
     init(clock: TestClock, snapshots: [DisplaySnapshot], hardware: MsiHardwareDualMode, power: Bool) {
         self.clock = clock; self.snapshots = snapshots; self.hardware = hardware; self.power = power
     }
-    func clearWrites() { writes = [] }
+    func clearWrites() { writes = []; writeTimes = [] }
+    func configurePowerOff(retainANT: Bool, msiDelay: TimeInterval?, restoresHID: Bool = false) {
+        retainANTWhenOff = retainANT; msiDelayAfterPowerOff = msiDelay; restoresHIDWithMSI = restoresHID
+    }
+    func setMSIDelayAfterPowerOn(_ seconds: TimeInterval) { msiDelayAfterPowerOn = seconds }
+    func setHIDAvailableAt(_ at: TimeInterval) { hardwareUnavailable = true; hidAvailableAt = at }
+    func setModeHIDOutage(_ seconds: TimeInterval) { modeHIDOutage = seconds }
+    func setFailAfterFHDWrite(_ value: Bool) { failAfterFHDWrite = value }
+    func setCancelAfterPowerOff(_ value: Bool) { cancelAfterPowerOff = value }
+    private func applyEvents() {
+        if let at = pendingMSIAt, clock.monotonicNow >= at {
+            snapshots.removeAll { $0.displayID == 20 }
+            snapshots.append(msi(hardware == .fhd ? fhd : uhd))
+            if restoresHIDWithMSI { hardwareUnavailable = false }
+            pendingMSIAt = nil
+        }
+        if let at = hidAvailableAt, clock.monotonicNow >= at {
+            hardwareUnavailable = false; hidAvailableAt = nil
+        }
+    }
     func replace(_ snapshots: [DisplaySnapshot]) { self.snapshots = snapshots }
     func setRevealANTOnPower(_ value: Bool) { revealANTOnPower = value }
     func setRevealANTOnFHD(_ value: Bool) { revealANTOnFHD = value }
@@ -491,6 +672,7 @@ private actor TestIO: RecoveryIO {
     func setPowerReadDelay(_ value: TimeInterval) { powerReadDelay = value }
     func setGate(_ gate: TestGate) { self.gate = gate }
     func observeDisplays(deadline: RecoveryDeadline) async throws -> DisplayObservation {
+        applyEvents()
         if enumerationFailure { throw RecoveryError.operationFailed("模拟枚举不可用") }
         return DisplayObservation(snapshots: snapshots, observedAt: clock.monotonicNow - observationAge)
     }
@@ -503,13 +685,21 @@ private actor TestIO: RecoveryIO {
     func setPlugPower(_ on: Bool, deadline: RecoveryDeadline) async throws {
         try deadline.check()
         writes.append("power:\(on)")
+        writeTimes.append(clock.monotonicNow)
         if on && failPowerOn { throw RecoveryError.plugUnavailable("模拟供电恢复失败") }
         power = on
         if !on {
-            snapshots = [msi(hardware == .fhd ? fhd : uhd)]
-        } else if revealANTOnPower && !snapshots.contains(where: { $0.displayID == 10 }) { snapshots.append(ant()) }
+            snapshots = retainANTWhenOff ? [ant()] : []
+            pendingMSIAt = msiDelayAfterPowerOff.map { clock.monotonicNow + $0 }
+            if cancelAfterPowerOff { deadline.cancellation.cancel("模拟断电后取消") }
+        } else {
+            if revealANTOnPower && !snapshots.contains(where: { $0.displayID == 10 }) { snapshots.append(ant()) }
+            if let delay = msiDelayAfterPowerOn { pendingMSIAt = clock.monotonicNow + delay }
+        }
+        applyEvents()
     }
     func readHardwareMode(deadline: RecoveryDeadline) async throws -> HardwareModeObservation {
+        applyEvents()
         if hardwareUnavailable { throw RecoveryError.monitorUnavailable }
         return HardwareModeObservation(mode: hardware, identity: "msi-usb-fixture", observedAt: clock.monotonicNow)
     }
@@ -517,7 +707,9 @@ private actor TestIO: RecoveryIO {
         try deadline.check()
         guard expectedIdentity == "msi-usb-fixture" else { throw RecoveryError.monitorUnavailable }
         writes.append("mode:\(mode.rawValue)")
+        writeTimes.append(clock.monotonicNow)
         hardware = mode
+        if modeHIDOutage > 0 { setHIDAvailableAt(clock.monotonicNow + modeHIDOutage) }
         snapshots = snapshots.map { snapshot in
             var result = snapshot
             if result.displayID == 20 { result.mode = mode == .uhd ? uhd : fhd }
@@ -527,6 +719,7 @@ private actor TestIO: RecoveryIO {
         if mode == .uhd && revealANTOnUHD && !snapshots.contains(where: { $0.displayID == 10 }) { snapshots.append(ant()) }
         if mode == .uhd && dropANTOnUHD { snapshots.removeAll { $0.displayID == 10 } }
         if mode == .fhd && cancelAfterFHD { deadline.cancellation.cancel("模拟切到 FHD 后取消") }
+        if mode == .fhd && failAfterFHDWrite { throw RecoveryError.operationTimedOut("模拟已切模但应答丢失") }
     }
 }
 private struct Harness: Sendable {

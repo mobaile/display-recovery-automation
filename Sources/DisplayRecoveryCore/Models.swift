@@ -207,16 +207,24 @@ public struct RecoveryTimeouts: Codable, Equatable, Sendable {
     public var restoreMode: TimeInterval
     public var dualDisplayStabilize: TimeInterval
     public var singleDisplayObserve: TimeInterval
+    public var powerOffMinimum: TimeInterval
+    public var powerOnSettle: TimeInterval
+    public var modeSettle: TimeInterval
+    public var hardwareReady: TimeInterval
 
     public init(
         powerOff: TimeInterval = 15,
-        newDisplayOnline: TimeInterval = 20,
+        newDisplayOnline: TimeInterval = 15,
         safeMode: TimeInterval = 20,
         powerOn: TimeInterval = 15,
         oldDisplayOnline: TimeInterval = 30,
         restoreMode: TimeInterval = 30,
         dualDisplayStabilize: TimeInterval = 10,
-        singleDisplayObserve: TimeInterval = 5
+        singleDisplayObserve: TimeInterval = 10,
+        powerOffMinimum: TimeInterval = 10,
+        powerOnSettle: TimeInterval = 15,
+        modeSettle: TimeInterval = 15,
+        hardwareReady: TimeInterval = 15
     ) {
         self.powerOff = powerOff
         self.newDisplayOnline = newDisplayOnline
@@ -226,6 +234,10 @@ public struct RecoveryTimeouts: Codable, Equatable, Sendable {
         self.restoreMode = restoreMode
         self.dualDisplayStabilize = dualDisplayStabilize
         self.singleDisplayObserve = singleDisplayObserve
+        self.powerOffMinimum = powerOffMinimum
+        self.powerOnSettle = powerOnSettle
+        self.modeSettle = modeSettle
+        self.hardwareReady = hardwareReady
     }
 
     public init(from decoder: Decoder) throws {
@@ -239,6 +251,10 @@ public struct RecoveryTimeouts: Codable, Equatable, Sendable {
         self.restoreMode = try container.decodeIfPresent(TimeInterval.self, forKey: .restoreMode) ?? def.restoreMode
         self.dualDisplayStabilize = try container.decodeIfPresent(TimeInterval.self, forKey: .dualDisplayStabilize) ?? def.dualDisplayStabilize
         self.singleDisplayObserve = try container.decodeIfPresent(TimeInterval.self, forKey: .singleDisplayObserve) ?? def.singleDisplayObserve
+        self.powerOffMinimum = try container.decodeIfPresent(TimeInterval.self, forKey: .powerOffMinimum) ?? def.powerOffMinimum
+        self.powerOnSettle = try container.decodeIfPresent(TimeInterval.self, forKey: .powerOnSettle) ?? def.powerOnSettle
+        self.modeSettle = try container.decodeIfPresent(TimeInterval.self, forKey: .modeSettle) ?? def.modeSettle
+        self.hardwareReady = try container.decodeIfPresent(TimeInterval.self, forKey: .hardwareReady) ?? def.hardwareReady
     }
 }
 
