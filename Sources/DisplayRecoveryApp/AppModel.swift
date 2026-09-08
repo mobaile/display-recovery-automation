@@ -1,247 +1,237 @@
 import AppKit
 import Combine
 import Foundation
-
 import DisplayRecoveryCore
 import DisplayRecoveryMac
 import MsiHid
+import MiotLocal
 
-@MainActor
-final class AppModel: ObservableObject {
-    @Published var appConfiguration: AppConfiguration
-    @Published var tokenInput: String
+@MainActor final class AppModel: ObservableObject {
+    @Published private(set) var appConfiguration: AppConfiguration
     @Published private(set) var tokenConfigured: Bool
     @Published private(set) var snapshots: [DisplaySnapshot] = []
     @Published private(set) var recoveryStatus = RecoveryStatus()
     @Published private(set) var msiStatus: MsiHidStatus?
     @Published private(set) var plugStateText = "未配置"
     @Published private(set) var lastError: String?
+    @Published private(set) var settingsBusy = false
 
     private let configurationStore = ConfigurationStore()
-    private let keychainStore = KeychainStore()
+    private let secretsStore = SecretsStore()
     private let displayProvider = MacDisplayProvider()
     private let hidController = MsiHidController()
     private let logStore = RecoveryLogStore()
-    private var platformIO: PlatformRecoveryIO?
-    private var coordinator: RecoveryCoordinator?
+    private let transactionStore = FileRecoveryTransactionStore()
+    private let processLock = ProcessTransactionLock()
+    private var platformIO: PlatformRecoveryIO!
+    private var coordinator: RecoveryCoordinator!
     private var refreshTask: Task<Void, Never>?
-    private var lastPlugRefresh = Date.distantPast
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var lastHardwareRefresh: TimeInterval = -10
+    private var refreshing = false
+    private var terminating = false
+    private var configurationLoadFailed = false
 
     init() {
-        appConfiguration = configurationStore.load()
-        let initialToken = (try? keychainStore.readToken()) ?? ""
-        tokenInput = initialToken
-        tokenConfigured = !initialToken.isEmpty
+        let (configuration, error) = configurationStore.loadOrRecover()
+        appConfiguration = configuration
+        tokenConfigured = secretsStore.readToken() != nil
+        configurationLoadFailed = error != nil
+        lastError = error?.localizedDescription
         rebuildCoordinator()
-
         displayProvider.startObserving { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                await self.refresh()
-                await self.coordinator?.notifyDisplaysChanged()
-            }
+            Task { @MainActor [weak self] in await self?.refresh() }
         }
-
+        let notifications = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(notifications.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in _ = await self?.coordinator.cancelRecovery(reason: "系统即将休眠", suspend: true) }
+        })
+        workspaceObservers.append(notifications.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.coordinator.notifySystemWokeUp()
+                await self?.refresh()
+            }
+        })
         refreshTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                await self.refresh()
-                try? await Task.sleep(nanoseconds: 700_000_000)
+                await self?.refresh()
+                do { try await Task.sleep(for: .milliseconds(700)) } catch { break }
             }
         }
-    }
-
-    deinit {
-        refreshTask?.cancel()
-        displayProvider.stopObserving()
     }
 
     var automaticRecoveryEnabled: Bool {
         get { appConfiguration.recovery.automaticRecoveryEnabled }
         set {
-            guard !recoveryStatus.recoveryInProgress else {
-                lastError = "恢复进行中，暂不能修改设置"
-                return
-            }
-            appConfiguration.recovery.automaticRecoveryEnabled = newValue
-            saveConfiguration()
+            guard !settingsBusy, !configurationLoadFailed else { return }
+            let old = appConfiguration
+            var updated = old
+            updated.recovery.automaticRecoveryEnabled = newValue
+            do {
+                try configurationStore.save(updated)
+                appConfiguration = updated
+                Task { await coordinator.setAutomaticRecoveryEnabled(newValue) }
+            } catch { lastError = error.localizedDescription }
         }
     }
 
     func refresh() async {
-        snapshots = displayProvider.snapshots()
-        platformIO?.recordDisplaySnapshots(snapshots)
-        if let coordinator {
-            recoveryStatus = await coordinator.status()
+        guard !refreshing, !terminating else { return }
+        refreshing = true
+        defer { refreshing = false }
+        do { snapshots = try displayProvider.checkedSnapshots() }
+        catch { lastError = error.localizedDescription }
+        recoveryStatus = await coordinator.status()
+        // 只有空闲且取得全局锁时才主动采样；恢复期间读取已发布的缓存。
+        let now = SystemRecoveryClock().monotonicNow
+        if now - lastHardwareRefresh >= 4, !(await coordinator.isBusy()), !settingsBusy, processLock.tryLock() {
+            lastHardwareRefresh = now
+            do {
+                let status = try await hidController.readStatus(deadline: RecoveryDeadline(seconds: 2))
+                msiStatus = status
+            } catch { msiStatus = MsiHidStatus(connected: false) }
+            do { plugStateText = try await platformIO.readPlugPower() ? "已开启" : "已关闭" }
+            catch { plugStateText = "未知（无法读取）" }
+            processLock.unlock()
+        } else {
+            let cached = hidController.cachedStatus()
+            msiStatus = now - cached.observedAt <= 5 ? cached : nil
         }
-
-        msiStatus = await Task.detached(priority: .utility) { [hidController] in
-            hidController.readStatus(retries: 0)
-        }.value
-
-        if Date().timeIntervalSince(lastPlugRefresh) >= 4 {
-            lastPlugRefresh = Date()
-            await refreshPlugState()
-        }
+        if !configurationLoadFailed, !settingsBusy { await coordinator.pollAutomaticRecovery() }
     }
 
     func triggerRecovery() {
-        guard !recoveryStatus.recoveryInProgress else { return }
-        guard let coordinator else {
-            lastError = "恢复服务尚未初始化"
-            return
-        }
-        Task { await coordinator.triggerManualRecovery() }
-    }
-
-    func resetStatus() {
-        Task { await coordinator?.resetStatus() }
-    }
-
-    func saveConfiguration() {
-        guard !recoveryStatus.recoveryInProgress else {
-            lastError = "恢复进行中，暂不能保存设置"
-            return
-        }
-        do {
-            try configurationStore.save(appConfiguration)
-            if !tokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                try keychainStore.saveToken(tokenInput.trimmingCharacters(in: .whitespacesAndNewlines))
-                tokenConfigured = true
-            }
-            rebuildCoordinator()
-            lastError = nil
-        } catch {
-            lastError = error.localizedDescription
+        guard !settingsBusy, !configurationLoadFailed else { return }
+        Task {
+            let result = await coordinator.triggerManualRecovery()
+            show(result)
+            await refresh()
         }
     }
-
-    func deleteToken() {
-        guard !recoveryStatus.recoveryInProgress else {
-            lastError = "恢复进行中，暂不能修改 Token"
-            return
-        }
-        do {
-            try keychainStore.deleteToken()
-            tokenInput = ""
-            tokenConfigured = false
-            rebuildCoordinator()
-            lastError = nil
-        } catch {
-            lastError = error.localizedDescription
+    func cancelRecovery() {
+        Task {
+            if let result = await coordinator.cancelRecovery(reason: "用户取消恢复") { show(result) }
+            await refresh()
         }
     }
-
-    func exportRedactedLog() -> URL? {
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
-        let destination = desktop.appendingPathComponent("display-recovery-log-\(Int(Date().timeIntervalSince1970)).txt")
-        do {
-            try logStore.exportRedacted(to: destination)
-            lastError = nil
-            return destination
-        } catch {
-            lastError = error.localizedDescription
-            return nil
+    func clearStop() {
+        Task {
+            if !(await coordinator.clearStop()) { lastError = "恢复服务忙，或无法保存解除停止状态" }
+            await refresh()
         }
     }
+    func shutdown() async {
+        terminating = true
+        refreshTask?.cancel()
+        displayProvider.stopObserving()
+        for observer in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        workspaceObservers = []
+        _ = await coordinator.cancelRecovery(reason: "应用正常退出", suspend: true)
+    }
 
+    func saveSettings(model: String, host: String, token: String, completion: @escaping @MainActor (Bool) -> Void) {
+        var updated = appConfiguration
+        updated.plug.model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.plug.host = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        commitSettings(updated, token: token.isEmpty ? nil : token, completion: completion)
+    }
     func useAsPowerControlled(_ snapshot: DisplaySnapshot) {
-        guard !recoveryStatus.recoveryInProgress else {
-            lastError = "恢复进行中，暂不能修改显示器角色"
-            return
-        }
-        appConfiguration.recovery.roles.powerControlled = snapshot.fingerprint
-        saveConfiguration()
+        guard !snapshot.isBuiltin else { return }
+        var updated = appConfiguration
+        updated.recovery.roles.powerControlled = snapshot.fingerprint
+        commitSettings(updated)
     }
-
     func useAsModeSwitch(_ snapshot: DisplaySnapshot) {
-        guard !recoveryStatus.recoveryInProgress else {
-            lastError = "恢复进行中，暂不能修改显示器角色"
-            return
-        }
-        appConfiguration.recovery.roles.modeSwitch = snapshot.fingerprint
-        saveConfiguration()
+        guard !snapshot.isBuiltin else { return }
+        var updated = appConfiguration
+        updated.recovery.roles.modeSwitch = snapshot.fingerprint
+        updated.recovery.roles.modeSwitchAliases = []
+        commitSettings(updated)
     }
-
-    func clearPowerControlledRole() {
-        guard !recoveryStatus.recoveryInProgress else {
-            lastError = "恢复进行中，暂不能修改显示器角色"
-            return
+    func importLegacyKeychainToken() {
+        mutateSettings {
+            guard let token = try self.secretsStore.migrateFromKeychainExplicitly() else {
+                throw ConfigurationStoreError.migrationFailed("未找到历史 Token")
+            }
+            _ = try MiotLocalClient(host: self.appConfiguration.plug.host, token: token, port: self.appConfiguration.plug.port)
         }
-        appConfiguration.recovery.roles.powerControlled = DisplayFingerprint()
-        saveConfiguration()
     }
+    func deleteToken() { mutateSettings { try self.secretsStore.deleteToken() } }
 
-    func clearModeSwitchRole() {
-        guard !recoveryStatus.recoveryInProgress else {
-            lastError = "恢复进行中，暂不能修改显示器角色"
-            return
+    private func commitSettings(_ updated: AppConfiguration, token: String? = nil, completion: @escaping @MainActor (Bool) -> Void = { _ in }) {
+        mutateSettings(completion: completion) {
+            guard MiotLocalClient.supportedModels.contains(updated.plug.model) else {
+                throw ConfigurationStoreError.corruptedConfiguration("不支持的插座型号")
+            }
+            if !updated.plug.host.isEmpty {
+                _ = try MiotLocalClient(host: updated.plug.host, token: token ?? self.secretsStore.readToken() ?? String(repeating: "0", count: 32), port: updated.plug.port)
+            }
+            let previous = self.appConfiguration
+            try self.configurationStore.save(updated)
+            do { if let token { try self.secretsStore.saveToken(token) } }
+            catch {
+                try self.configurationStore.save(previous)
+                throw error
+            }
+            self.appConfiguration = updated
+            self.configurationLoadFailed = false
         }
-        appConfiguration.recovery.roles.modeSwitch = DisplayFingerprint()
-        saveConfiguration()
     }
-
+    private func mutateSettings(completion: @escaping @MainActor (Bool) -> Void = { _ in }, _ mutation: @escaping @MainActor () throws -> Void) {
+        guard !settingsBusy, !terminating else { completion(false); return }
+        settingsBusy = true
+        Task {
+            var succeeded = false
+            defer { settingsBusy = false; completion(succeeded) }
+            _ = await coordinator.status()
+            guard await coordinator.retireForConfigurationChange() else {
+                lastError = "恢复正在进行或仍有未完成责任，暂不能更改目标与凭据"
+                return
+            }
+            guard processLock.tryLock() else {
+                await coordinator.resumeAfterConfigurationFailure()
+                lastError = "其他进程正在使用设备，暂不能更改设置"
+                return
+            }
+            defer { processLock.unlock() }
+            do {
+                guard try transactionStore.load()?.hasPendingCleanup != true else {
+                    throw RecoveryError.operationFailed("存在未完成事务，必须先处理恢复责任")
+                }
+                try mutation()
+                tokenConfigured = secretsStore.readToken() != nil
+                rebuildCoordinator()
+                lastError = nil
+                succeeded = true
+            } catch {
+                await coordinator.resumeAfterConfigurationFailure()
+                lastError = error.localizedDescription
+            }
+        }
+    }
+    private func show(_ result: RecoveryOutcome) {
+        switch result {
+        case .success: lastError = nil
+        case .failure(let text), .stopped(let text), .skipped(let text), .cancelled(let text): lastError = text
+        case .busy: lastError = "已有恢复或设备操作在执行"
+        }
+    }
     func roleName(_ role: DisplayRole) -> String {
-        let fingerprint: DisplayFingerprint
-        switch role {
-        case .powerControlled:
-            fingerprint = appConfiguration.recovery.roles.powerControlled
-        case .modeSwitch:
-            fingerprint = appConfiguration.recovery.roles.modeSwitch
-        }
-        return fingerprint.displayName.isEmpty ? "未配置" : fingerprint.displayName
+        let fp = role == .powerControlled ? appConfiguration.recovery.roles.powerControlled : appConfiguration.recovery.roles.modeSwitch
+        return fp.displayName.isEmpty ? "未配置" : fp.displayName
     }
-
-    func roleSnapshot(_ role: DisplayRole) -> DisplaySnapshot? {
-        let fingerprint: DisplayFingerprint
-        switch role {
-        case .powerControlled:
-            fingerprint = appConfiguration.recovery.roles.powerControlled
-        case .modeSwitch:
-            fingerprint = appConfiguration.recovery.roles.modeSwitch
-        }
-        guard fingerprint.isConfigured else { return nil }
-        let matches = snapshots.filter { fingerprint.matches($0.fingerprint) }
-        return matches.count == 1 ? matches[0] : nil
+    func exportRedactedLog() -> URL? {
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+        let destination = desktop.appendingPathComponent("display-recovery-log-\(Int(Date().timeIntervalSince1970)).txt")
+        do { try logStore.exportRedacted(to: destination); return destination }
+        catch { lastError = error.localizedDescription; return nil }
     }
-
-    private func refreshPlugState() async {
-        guard let platformIO else {
-            plugStateText = "未配置"
-            return
-        }
-        do {
-            plugStateText = try await platformIO.readPlugPower() ? "已开启" : "已关闭"
-        } catch {
-            plugStateText = "不可用"
-        }
-    }
-
     private func rebuildCoordinator() {
-        let token = (try? keychainStore.readToken()) ?? tokenInput
-        let io = PlatformRecoveryIO(
-            displayProvider: displayProvider,
-            hidController: hidController,
-            plugConfiguration: appConfiguration.plug,
-            recoveryConfiguration: appConfiguration.recovery,
-            token: token.isEmpty ? nil : token,
-            logStore: logStore
-        )
-        platformIO = io
-        coordinator = RecoveryCoordinator(
-            io: io,
-            configuration: appConfiguration.recovery,
-            log: { [logStore] message in logStore.append(message) }
-        )
-    }
-}
-
-private extension DisplayFingerprint {
-    var isConfigured: Bool {
-        [vendor, model, serial, edidHash].contains { value in
-            guard let value else { return false }
-            return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
+        platformIO = PlatformRecoveryIO(displayProvider: displayProvider, hidController: hidController,
+            plugConfiguration: appConfiguration.plug, recoveryConfiguration: appConfiguration.recovery, token: secretsStore.readToken())
+        coordinator = RecoveryCoordinator(io: platformIO, configuration: appConfiguration.recovery,
+            transactionStore: transactionStore, transactionLock: processLock,
+            log: { [logStore] message in logStore.append(message) })
     }
 }

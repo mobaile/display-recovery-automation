@@ -4,3 +4,6 @@ DerivedData/
 *.xcodeproj/
 *.xcworkspace/
 .DS_Store
+secrets.json
+*.log
+display-recovery-log-*.txt

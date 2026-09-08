@@ -4,6 +4,7 @@ import XCTest
 @testable import DisplayRecoveryCore
 @testable import DisplayRecoveryMac
 @testable import MiotLocal
+@testable import MsiHid
 
 final class PlatformTests: XCTestCase {
     func testConfigurationRoundTripsWithoutToken() throws {
@@ -23,9 +24,41 @@ final class PlatformTests: XCTestCase {
         )
         let store = ConfigurationStore(url: url)
         try store.save(configuration)
-        XCTAssertEqual(store.load(), configuration)
+        XCTAssertEqual(try store.load(), configuration)
         let data = try Data(contentsOf: url)
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("token"))
+    }
+
+    func testCorruptedConfigurationThrowsError() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("display-recovery-corrupt-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try "NOT_JSON".write(to: url, atomically: true, encoding: .utf8)
+        let store = ConfigurationStore(url: url)
+        XCTAssertThrowsError(try store.load()) { error in
+            XCTAssertTrue(error is ConfigurationStoreError)
+        }
+    }
+
+    func testSecretsStoreRoundTripsTokenAndSets0600() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("display-recovery-secrets-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let store = SecretsStore(url: url)
+        XCTAssertNil(store.readToken())
+
+        let testToken = "3457607c43a7f21d9db4166e0ef2788c"
+        try store.saveToken(testToken)
+        XCTAssertEqual(store.readToken(), testToken)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        let perms = attrs[.posixPermissions] as? NSNumber
+        XCTAssertEqual(perms?.intValue, 0o600, "secrets.json 必须设置为 0600 权限")
+
+        try store.deleteToken()
+        XCTAssertNil(store.readToken())
     }
 
     func testMiotClientValidatesHostAndTokenBeforeNetwork() {
@@ -39,19 +72,56 @@ final class PlatformTests: XCTestCase {
         XCTAssertTrue(MiotLocalClient.supportedModels.contains("cuco.plug.v3"))
     }
 
-    func testRedactedLogRemovesIPv4Addresses() throws {
+    func testRedactedLogRemovesIPv4AddressesAndTokens() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("display-recovery-automation-\(UUID().uuidString).log")
         defer { try? FileManager.default.removeItem(at: url) }
         let logs = RecoveryLogStore(url: url)
-        logs.append("连接 192.168.1.20 失败")
+        logs.append("连接 192.168.1.20 失败，Token 为 3457607c43a7f21d9db4166e0ef2788c")
         let contents = logs.redactedContents()
         XCTAssertTrue(contents.contains("<IP>"))
         XCTAssertFalse(contents.contains("192.168.1.20"))
+        XCTAssertTrue(contents.contains("<TOKEN>"))
+        XCTAssertFalse(contents.contains("3457607c43a7f21d9db4166e0ef2788c"))
     }
 
-    func testDisplayProviderCanEnumerateWithoutThrowing() {
-        let snapshots = MacDisplayProvider().snapshots()
+    func testProcessTransactionLockMutualExclusion() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recovery-test-\(UUID().uuidString).lock")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let lock1 = ProcessTransactionLock(url: url)
+        let lock2 = ProcessTransactionLock(url: url)
+
+        XCTAssertTrue(lock1.tryLock())
+        XCTAssertFalse(lock1.tryLock(), "同一对象不能向另一个调用方重复授予锁")
+        XCTAssertFalse(lock2.tryLock(), "第二个锁对象必须加锁失败")
+
+        lock1.unlock()
+        XCTAssertTrue(lock2.tryLock(), "第一个锁释放后，第二个锁可以成功加锁")
+        lock2.unlock()
+    }
+
+    func testTransactionLockExcludesAnotherProcess() throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/perl") else { throw XCTSkip("此环境没有 Perl 锁测试工具") }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("recovery-process-\(UUID()).lock")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let lock = ProcessTransactionLock(url: url)
+        func childExit() throws -> Int32 {
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+            child.arguments = ["-MFcntl=:flock", "-e", "open(my $f, '>>', $ARGV[0]) or exit 2; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 7);", url.path]
+            try child.run(); child.waitUntilExit()
+            return child.terminationStatus
+        }
+        XCTAssertTrue(lock.tryLock())
+        XCTAssertEqual(try childExit(), 7)
+        lock.unlock()
+        XCTAssertEqual(try childExit(), 0)
+    }
+
+    @MainActor func testDisplayProviderCanEnumerateWithoutThrowing() throws {
+        let snapshots = try MacDisplayProvider().checkedSnapshots()
         XCTAssertEqual(Set(snapshots.map(\.displayID)).count, snapshots.count)
         XCTAssertTrue(snapshots.allSatisfy(\.online))
     }
@@ -71,6 +141,81 @@ final class PlatformTests: XCTestCase {
         let finalPower = try await client.getPower()
         XCTAssertFalse(finalPower)
     }
+
+    func testTransactionCorruptionIsAnErrorAndJournalUses0600() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = FileRecoveryTransactionStore(url: folder.appendingPathComponent("transaction.json"))
+        XCTAssertNil(try store.load())
+        try store.save(RecoveryTransaction(attemptCount: 3, isStopped: true, modePending4K: true))
+        XCTAssertEqual(try store.load()?.attemptCount, 3)
+        let permissions = try FileManager.default.attributesOfItem(atPath: store.url.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(permissions?.intValue, 0o600)
+        try Data("broken".utf8).write(to: store.url)
+        XCTAssertThrowsError(try store.load())
+    }
+
+    func testLegacyTransactionKeepsStopAndDoesNotInventTargetOrBudget() throws {
+        let original = RecoveryTransaction(attemptCount: 3, isStopped: true, powerPendingRestore: true, modePending4K: true)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any])
+        for key in ["schemaVersion", "target", "msiHIDIdentity", "powerCleanupUsed", "modeCleanupUsed"] { json.removeValue(forKey: key) }
+        let data = try JSONSerialization.data(withJSONObject: json)
+        let restored = try JSONDecoder().decode(RecoveryTransaction.self, from: data)
+        XCTAssertEqual(restored.schemaVersion, 1)
+        XCTAssertTrue(restored.isStopped)
+        XCTAssertEqual(restored.attemptCount, 3)
+        XCTAssertNil(restored.target)
+        XCTAssertTrue(restored.powerCleanupUsed)
+        XCTAssertTrue(restored.modeCleanupUsed)
+    }
+
+    func testUnsupportedConfigurationAndInvalidTokenAreRejected() throws {
+        XCTAssertThrowsError(try JSONDecoder().decode(AppConfiguration.self, from: Data("{\"version\":999}".utf8)))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = SecretsStore(url: url)
+        XCTAssertThrowsError(try store.saveToken(String(repeating: "z", count: 32)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testHIDParserRequiresExactRegisterAndResponseShape() {
+        XCTAssertEqual(MsiHidProtocol.mode(from: "5b002E0000"), .uhd)
+        XCTAssertEqual(MsiHidProtocol.mode(from: "5b002E0001"), .fhd)
+        for response in ["4f000", "5b00190000", "junk000", "5b002E00000", "NO_RESPONSE", "5b002E0999"] {
+            XCTAssertEqual(MsiHidProtocol.mode(from: response), .unknown, response)
+        }
+    }
+
+    func testLostSetReplyReadsBackWithoutRepeatingWrite() async throws {
+        let token = String(repeating: "ab", count: 16)
+        let simulator = try MiotSimulator(token: token, model: "chuangmi.plug.212a01", dropSetReply: true)
+        simulator.start()
+        defer { simulator.stop() }
+        let client = try MiotLocalClient(host: "127.0.0.1", token: token, port: simulator.port)
+        try await client.setPower(false, expectedModel: "chuangmi.plug.212a01", deadline: RecoveryDeadline(seconds: 5))
+        let actual = try await client.getPower()
+        XCTAssertFalse(actual)
+        XCTAssertEqual(simulator.setCommands, 1)
+    }
+
+    func testNetworkDeadlineAndCancellationBoundSilentPeer() async throws {
+        let token = String(repeating: "ab", count: 16)
+        let simulator = try MiotSimulator(token: token, model: "chuangmi.plug.212a01", dropAllReplies: true)
+        simulator.start()
+        defer { simulator.stop() }
+        let client = try MiotLocalClient(host: "127.0.0.1", token: token, port: simulator.port)
+        var started = ContinuousClock.now
+        do {
+            _ = try await client.getPower(deadline: RecoveryDeadline(seconds: 0.15))
+            XCTFail("无应答不能成功")
+        } catch {}
+        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+        started = .now
+        let task = Task { try await client.getPower(deadline: RecoveryDeadline(seconds: 5)) }
+        try await Task.sleep(for: .milliseconds(100))
+        task.cancel()
+        do { _ = try await task.value; XCTFail("取消后不能成功") } catch {}
+        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    }
 }
 
 /// 只绑定 127.0.0.1 的最小 miIO/MIoT 模拟器，不访问真实局域网设备。
@@ -81,9 +226,13 @@ private final class MiotSimulator: @unchecked Sendable {
     private let stateLock = NSLock()
     private var running = false
     private var power = true
+    private var writeCount = 0
+    private let dropSetReply: Bool
+    private let dropAllReplies: Bool
+    var setCommands: Int { stateLock.withLock { writeCount } }
     let port: UInt16
 
-    init(token: String, model: String) throws {
+    init(token: String, model: String, dropSetReply: Bool = false, dropAllReplies: Bool = false) throws {
         guard let tokenData = Self.decodeToken(token) else {
             throw NSError(domain: "MiotSimulator", code: 1, userInfo: [NSLocalizedDescriptionKey: "token 无效"])
         }
@@ -94,6 +243,8 @@ private final class MiotSimulator: @unchecked Sendable {
         self.socketFD = socketFD
         self.token = tokenData
         self.model = model
+        self.dropSetReply = dropSetReply
+        self.dropAllReplies = dropAllReplies
 
         var timeout = timeval(tv_sec: 0, tv_usec: 200_000)
         setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
@@ -193,6 +344,7 @@ private final class MiotSimulator: @unchecked Sendable {
     }
 
     private func makeResponse(for packet: Data, deviceID: UInt32) -> Data? {
+        if dropAllReplies { return nil }
         guard packet.count >= 32,
               packet.readUInt16BE(at: 0) == 0x2131 else {
             return nil
@@ -226,6 +378,7 @@ private final class MiotSimulator: @unchecked Sendable {
                 "result": [["code": 0, "value": currentPower]]
             ]
         case "set_properties":
+            stateLock.withLock { writeCount += 1 }
             if let params = command["params"] as? [[String: Any]],
                let first = params.first,
                let value = first["value"] as? Bool {
@@ -236,6 +389,7 @@ private final class MiotSimulator: @unchecked Sendable {
             // miIO/MIoT 固件常见返回格式是 [0]；客户端同时兼容
             // 另一种 [{"code": 0}] 形式。
             result = ["id": requestID, "result": [0]]
+            if dropSetReply { return nil }
         default:
             result = [
                 "id": requestID,
@@ -299,7 +453,7 @@ private final class MiotSimulator: @unchecked Sendable {
     private static func crypt(operation: CCOperation, input: Data, token: Data) throws -> Data {
         let key = md5(token)
         var ivInput = Data()
-        ivInput.append(md5(key))
+        ivInput.append(key)
         ivInput.append(token)
         let iv = md5(ivInput)
 

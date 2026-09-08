@@ -17,8 +17,11 @@ public final class MacDisplayProvider: @unchecked Sendable {
     }
 
     private var callbackBox: CallbackBox?
-    private let callback: CGDisplayReconfigurationCallBack = { _, _, userInfo in
+    private let callback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
         guard let userInfo else { return }
+        if flags.contains(.beginConfigurationFlag) {
+            return
+        }
         let box = Unmanaged<CallbackBox>.fromOpaque(userInfo).takeUnretainedValue()
         box.handler()
     }
@@ -42,25 +45,30 @@ public final class MacDisplayProvider: @unchecked Sendable {
         self.callbackBox = nil
     }
 
-    public func snapshots() -> [DisplaySnapshot] {
+    @MainActor public func snapshots() -> [DisplaySnapshot] {
+        (try? checkedSnapshots()) ?? []
+    }
+
+    @MainActor public func checkedSnapshots() throws -> [DisplaySnapshot] {
         var count: UInt32 = 0
-        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
-            return []
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success else {
+            throw RecoveryError.operationFailed("CoreGraphics 无法读取显示器数量")
         }
+        if count == 0 { return [] }
 
         var displayIDs = Array(repeating: CGDirectDisplayID(0), count: Int(count))
         guard CGGetOnlineDisplayList(count, &displayIDs, &count) == .success else {
-            return []
+            throw RecoveryError.operationFailed("CoreGraphics 显示器枚举失败")
         }
 
         return displayIDs.prefix(Int(count)).map(makeSnapshot(displayID:))
     }
 
-    public func snapshot(for displayID: CGDirectDisplayID) -> DisplaySnapshot {
+    @MainActor public func snapshot(for displayID: CGDirectDisplayID) -> DisplaySnapshot {
         makeSnapshot(displayID: displayID)
     }
 
-    private func makeSnapshot(displayID: CGDirectDisplayID) -> DisplaySnapshot {
+    @MainActor private func makeSnapshot(displayID: CGDirectDisplayID) -> DisplaySnapshot {
         let mode = CGDisplayCopyDisplayMode(displayID).map { mode in
             DisplayModeSignature(
                 width: mode.pixelWidth,
@@ -81,13 +89,17 @@ public final class MacDisplayProvider: @unchecked Sendable {
         let vendor = info.vendorName ?? vendorFromProductName(productName)
         let model = productName ?? "\(vendorNumber):\(productNumber)"
         let serial = info.serial ?? (serialNumber == 0 ? nil : String(serialNumber))
+        let isBuiltin = CGDisplayIsBuiltin(displayID) != 0
 
         return DisplaySnapshot(
             displayID: displayID,
             fingerprint: DisplayFingerprint(vendor: vendor, model: model, serial: serial, edidHash: info.edidHash),
             mode: mode,
             online: true,
-            connectionDescription: info.connectionDescription
+            isBuiltin: isBuiltin,
+            connectionDescription: info.connectionDescription,
+            isActive: CGDisplayIsActive(displayID) != 0,
+            isAsleep: CGDisplayIsAsleep(displayID) != 0
         )
     }
 
@@ -104,6 +116,8 @@ public final class MacDisplayProvider: @unchecked Sendable {
         // IODisplayConnect 服务枚举读取同一份 EDID 派生信息，兼容当前 SDK。
         let targetVendor = CGDisplayVendorNumber(displayID)
         let targetProduct = CGDisplayModelNumber(displayID)
+        let targetSerial = CGDisplaySerialNumber(displayID)
+        var candidates: [DisplayInfo] = []
         var iterator: io_iterator_t = 0
         guard let matching = IOServiceMatching("IODisplayConnect"),
               IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
@@ -125,10 +139,12 @@ public final class MacDisplayProvider: @unchecked Sendable {
             let productID = (dictionary["DisplayProductID"] as? NSNumber)?.uint32Value
             if targetVendor != 0, targetProduct != 0,
                vendorID == targetVendor && productID == targetProduct {
-                return info
+                let serial = (dictionary["DisplaySerialNumber"] as? NSNumber)?.uint32Value
+                if targetSerial != 0, serial != targetSerial { continue }
+                candidates.append(info)
             }
         }
-        return DisplayInfo()
+        return candidates.count == 1 ? candidates[0] : DisplayInfo()
     }
 
     private func makeDisplayInfo(from dictionary: [String: Any]) -> DisplayInfo {

@@ -1,163 +1,84 @@
 import Foundation
-import os
-
+import CryptoKit
 import DisplayRecoveryCore
 import MsiHid
 import MiotLocal
 
-public final class PlatformRecoveryIO: RecoveryIO, @unchecked Sendable {
+/// 固定配置的 I/O 适配器。设备会话在各自串行通道内运行，AppKit 枚举在 MainActor。
+public final class PlatformRecoveryIO: RecoveryIO, Sendable {
     private let displayProvider: MacDisplayProvider
     private let hidController: MsiHidController
     private let plugClient: MiotLocalClient?
     private let configuration: RecoveryConfiguration
     private let plugModel: String
-    private let logStore: RecoveryLogStore
-    private let logger = Logger(subsystem: "local.codex.display-recovery-automation", category: "recovery")
-    private let modeCacheLock = NSLock()
-    private var lastKnownMode: DisplayModeSignature?
+    public let targetIdentity: String
 
-    public init(
-        displayProvider: MacDisplayProvider,
-        hidController: MsiHidController,
-        plugConfiguration: PlugConfiguration,
-        recoveryConfiguration: RecoveryConfiguration,
-        token: String?,
-        logStore: RecoveryLogStore = RecoveryLogStore()
-    ) {
-        self.displayProvider = displayProvider
-        self.hidController = hidController
-        self.configuration = recoveryConfiguration
-        self.plugModel = plugConfiguration.model
-        self.logStore = logStore
-        if let token,
-           !plugConfiguration.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let client = try? MiotLocalClient(
-                host: plugConfiguration.host,
-                token: token,
-                port: plugConfiguration.port
-           ) {
-            self.plugClient = client
-        } else {
-            self.plugClient = nil
+    public func validateTarget(deadline: RecoveryDeadline) async throws {
+        try deadline.check("核对当前配置")
+        let saved = try ConfigurationStore().load()
+        let token = SecretsStore().readToken() ?? ""
+        let identity = Self.identity(plug: saved.plug, token: token)
+        guard saved.recovery.roles == configuration.roles, identity == targetIdentity else {
+            throw RecoveryError.operationFailed("等待设备锁期间配置已经改变，请使用最新配置重试")
+        }
+        try deadline.check("核对当前配置")
+    }
+
+    public init(displayProvider: MacDisplayProvider, hidController: MsiHidController,
+                plugConfiguration: PlugConfiguration, recoveryConfiguration: RecoveryConfiguration,
+                token: String?, logStore: RecoveryLogStore = RecoveryLogStore()) {
+        self.displayProvider = displayProvider; self.hidController = hidController
+        self.configuration = recoveryConfiguration; self.plugModel = plugConfiguration.model
+        let normalized = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // 包括凭据版本的不可逆指纹，防止旧事务借用后来换过的插座配置。
+        targetIdentity = Self.identity(plug: plugConfiguration, token: normalized)
+        self.plugClient = try? MiotLocalClient(host: plugConfiguration.host, token: normalized, port: plugConfiguration.port)
+    }
+    public func observeDisplays(deadline: RecoveryDeadline) async throws -> DisplayObservation {
+        try deadline.check("显示器枚举")
+        return try await MainActor.run {
+            try deadline.check("显示器枚举")
+            let snapshots = try displayProvider.checkedSnapshots()
+            try deadline.check("显示器枚举")
+            return DisplayObservation(snapshots: snapshots, observedAt: deadline.clock.monotonicNow)
         }
     }
-
-    public func displaySnapshots() async -> [DisplaySnapshot] {
-        let snapshots = displayProvider.snapshots()
-        recordMode(from: snapshots)
-        return snapshots
+    public func readPlugPower(deadline: RecoveryDeadline = RecoveryDeadline(seconds: 5)) async throws -> Bool {
+        let client = try checkedPlug()
+        _ = try await client.validate(expectedModel: plugModel, deadline: deadline)
+        return try await client.getPower(deadline: deadline)
     }
-
-    /// 由菜单栏轮询主动提供最近一次显示器快照，保证在新屏暂时离线时仍能
-    /// 保存流程开始前的真实 4K 刷新率。
-    public func recordDisplaySnapshots(_ snapshots: [DisplaySnapshot]) {
-        recordMode(from: snapshots)
+    public func setPlugPower(_ on: Bool, deadline: RecoveryDeadline) async throws {
+        try deadline.check("插座写入")
+        try await checkedPlug().setPower(on, expectedModel: plugModel, deadline: deadline)
     }
-
-    public func setPlugPower(_ on: Bool) async throws {
-        guard let plugClient else {
-            throw RecoveryError.plugNotConfigured
+    public func readHardwareMode(deadline: RecoveryDeadline) async throws -> HardwareModeObservation {
+        let status = try await hidController.readStatus(deadline: deadline)
+        try deadline.check("MSI 硬件模式读回")
+        if status.isAmbiguous { throw RecoveryError.ambiguousDisplay("MSI HID") }
+        guard status.connected, let identity = status.identity else { throw RecoveryError.monitorUnavailable }
+        return HardwareModeObservation(mode: status.mode, identity: identity, observedAt: status.observedAt)
+    }
+    public func setHardwareMode(_ mode: MsiHardwareDualMode, expectedIdentity: String, deadline: RecoveryDeadline) async throws {
+        let observation = try await observeDisplays(deadline: deadline)
+        let resolution = DisplayRoleResolver.resolve(role: .modeSwitch, rolesConfig: configuration.roles, snapshots: observation.snapshots)
+        switch resolution {
+        case .ambiguous, .unconfigured: throw RecoveryError.ambiguousDisplay("MSI 写入目标")
+        case .notFound where mode == .fhd: throw RecoveryError.monitorUnavailable
+        default: break
         }
+        try deadline.check("MSI 硬件模式写入")
+        try await hidController.setMode(mode, expectedIdentity: expectedIdentity, deadline: deadline)
+    }
+    private func checkedPlug() throws -> MiotLocalClient {
+        guard let plugClient else { throw RecoveryError.plugNotConfigured }
         guard MiotLocalClient.supportedModels.contains(plugModel) else {
             throw RecoveryError.plugModelMismatch(expected: plugModel, actual: "不支持的型号")
         }
-        logger.info("设置智能插座电源：\(on ? "开启" : "关闭")")
-        logStore.append("设置智能插座电源：\(on ? "开启" : "关闭")")
-        do {
-            _ = try await plugClient.validate(expectedModel: plugModel)
-            try await plugClient.setPower(on)
-            logStore.append("智能插座命令已返回")
-        } catch let error as RecoveryError {
-            logStore.append("智能插座命令失败：\(error.localizedDescription)")
-            throw error
-        } catch {
-            logStore.append("智能插座命令失败：\(error.localizedDescription)")
-            throw RecoveryError.plugUnavailable(error.localizedDescription)
-        }
+        return plugClient
     }
-
-    public func readPlugPower() async throws -> Bool {
-        guard let plugClient else {
-            throw RecoveryError.plugNotConfigured
-        }
-        guard MiotLocalClient.supportedModels.contains(plugModel) else {
-            throw RecoveryError.plugModelMismatch(expected: plugModel, actual: "不支持的型号")
-        }
-        do {
-            _ = try await plugClient.validate(expectedModel: plugModel)
-            return try await plugClient.getPower()
-        } catch let error as RecoveryError {
-            throw error
-        } catch {
-            throw RecoveryError.plugUnavailable(error.localizedDescription)
-        }
-    }
-
-    public func readModeSwitchMode() async throws -> DisplayModeSignature? {
-        let snapshots = displayProvider.snapshots()
-        recordMode(from: snapshots)
-        if let snapshot = snapshots.first(where: {
-            configuration.roles.modeSwitch.matches($0.fingerprint)
-        }), let mode = snapshot.mode {
-            return mode
-        }
-
-        let cachedMode = cachedMode()
-        let status = hidController.readStatus(retries: 1)
-        guard status.connected else { return nil }
-        switch status.mode {
-        case .uhd:
-            if let cachedMode,
-               cachedMode.width >= 3000,
-               cachedMode.height >= 1800 {
-                return cachedMode
-            }
-            return DisplayModeSignature(width: 3840, height: 2160, refreshRate: 0)
-        case .fhd:
-            if let cachedMode,
-               cachedMode.width == 1920,
-               cachedMode.height == 1080 {
-                return cachedMode
-            }
-            return MsiDualMode.fhd.displayMode
-        case .unknown:
-            return nil
-        }
-    }
-
-    public func setModeSwitchSafeMode() async throws {
-        guard hidController.setMode(.fhd) else {
-            throw RecoveryError.monitorUnavailable
-        }
-    }
-
-    public func restoreModeSwitchMode(_ mode: DisplayModeSignature) async throws {
-        let target: MsiDualMode
-        if mode.width >= 3000 && mode.height >= 1800 {
-            target = .uhd
-        } else if mode.width == 1920 && mode.height == 1080 {
-            target = .fhd
-        } else {
-            throw RecoveryError.modeNotAvailable(mode)
-        }
-        guard hidController.setMode(target) else {
-            throw RecoveryError.monitorUnavailable
-        }
-    }
-
-    private func recordMode(from snapshots: [DisplaySnapshot]) {
-        guard let mode = snapshots.first(where: {
-            configuration.roles.modeSwitch.matches($0.fingerprint) &&
-                $0.online && $0.mode != nil
-        })?.mode else { return }
-        modeCacheLock.lock()
-        lastKnownMode = mode
-        modeCacheLock.unlock()
-    }
-
-    private func cachedMode() -> DisplayModeSignature? {
-        modeCacheLock.lock()
-        defer { modeCacheLock.unlock() }
-        return lastKnownMode
+    private static func identity(plug: PlugConfiguration, token: String) -> String {
+        let data = Data("\(plug.model)|\(plug.host)|\(plug.port)|\(token)".utf8)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

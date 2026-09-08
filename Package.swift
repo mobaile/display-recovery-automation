@@ -55,7 +55,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "DisplayRecoveryApp",
-            dependencies: ["DisplayRecoveryCore", "MsiHid", "DisplayRecoveryMac"],
+            dependencies: ["DisplayRecoveryCore", "MsiHid", "MiotLocal", "DisplayRecoveryMac"],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("CoreGraphics"),

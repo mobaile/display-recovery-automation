@@ -55,204 +55,187 @@ public enum MiotLocalError: LocalizedError, Equatable, Sendable {
 }
 
 public final class MiotLocalClient: @unchecked Sendable {
-    public static let supportedModels: Set<String> = [
-        "chuangmi.plug.212a01",
-        "cuco.plug.v3"
-    ]
-
+    public static let supportedModels: Set<String> = ["chuangmi.plug.212a01", "cuco.plug.v3"]
     private let host: String
     private let port: UInt16
     private let token: Data
-    private let lock = NSLock()
+    // 所有会话状态只在此队列访问，网络轮询在每个时间片检查截止时间和取消。
+    private let queue = DispatchQueue(label: "local.codex.miot.serial")
     private var sequence: UInt32 = 1
     private var deviceID: UInt32?
+    private var boundDeviceID: UInt32?
+    private var deviceTimeBase: UInt32?
+    private var localTimeBase: TimeInterval = 0
+    private var validatedModel: String?
 
     public init(host: String, token: String, port: UInt16 = 54321) throws {
         guard Self.isIPv4(host) else { throw MiotLocalError.invalidHost }
-        guard let tokenData = Self.decodeToken(token) else { throw MiotLocalError.invalidToken }
-        self.host = host
-        self.port = port
-        self.token = tokenData
+        guard let data = Self.decodeToken(token) else { throw MiotLocalError.invalidToken }
+        self.host = host; self.port = port; self.token = data
     }
 
-    public func deviceInfo() async throws -> MiotDeviceInfo {
-        let payload = try await request(method: "miIO.info", params: [])
-        guard let dictionary = firstResultDictionary(payload),
-              let model = dictionary["model"] as? String else {
-            throw MiotLocalError.invalidResponse("缺少 model")
-        }
-        return MiotDeviceInfo(
-            model: model,
-            firmwareVersion: dictionary["fw_ver"] as? String,
-            hardwareVersion: dictionary["hw_ver"] as? String
-        )
-    }
-
-    public func validate(expectedModel: String) async throws -> MiotDeviceInfo {
-        let info = try await deviceInfo()
-        guard info.model == expectedModel else {
-            throw RecoveryError.plugModelMismatch(expected: expectedModel, actual: info.model)
-        }
-        return info
-    }
-
-    public func getPower() async throws -> Bool {
-        let payload = try await request(
-            method: "get_properties",
-            params: [["siid": 2, "piid": 1]]
-        )
-        guard let result = payload["result"] as? [[String: Any]],
-              let value = result.first?["value"] as? Bool else {
-            throw MiotLocalError.invalidResponse("缺少开关状态")
-        }
-        return value
-    }
-
-    public func setPower(_ on: Bool) async throws {
-        let payload = try await request(
-            method: "set_properties",
-            params: [["siid": 2, "piid": 1, "value": on]]
-        )
-        if let error = payload["error"] as? [String: Any] {
-            throw MiotLocalError.deviceError(error["message"] as? String ?? "未知错误")
-        }
-        guard Self.isSuccessfulSetPropertiesResult(payload["result"]) else {
-            throw MiotLocalError.invalidResponse("开关命令未返回成功状态")
+    public func deviceInfo(deadline: RecoveryDeadline = RecoveryDeadline(seconds: 10)) async throws -> MiotDeviceInfo {
+        try await perform(deadline) {
+            try self.info(self.requestRead("miIO.info", params: [], deadline: deadline))
         }
     }
-
-    private static func isSuccessfulSetPropertiesResult(_ value: Any?) -> Bool {
-        if let result = value as? [NSNumber],
-           let code = result.first {
-            return code.intValue == 0
-        }
-        if let result = value as? [[String: Any]],
-           let code = result.first?["code"] as? NSNumber {
-            return code.intValue == 0
-        }
-        return false
+    public func validate(expectedModel: String, deadline: RecoveryDeadline = RecoveryDeadline(seconds: 10)) async throws -> MiotDeviceInfo {
+        try await perform(deadline) { try self.validateLocked(expectedModel, deadline: deadline) }
     }
-
-    private func request(method: String, params: Any) async throws -> [String: Any] {
-        var attempt = 0
-        while true {
+    public func getPower(deadline: RecoveryDeadline = RecoveryDeadline(seconds: 10)) async throws -> Bool {
+        try await perform(deadline) { try self.power(self.requestRead("get_properties", params: [["siid": 2, "piid": 1]], deadline: deadline)) }
+    }
+    public func setPower(_ on: Bool, expectedModel: String? = nil, deadline: RecoveryDeadline = RecoveryDeadline(seconds: 10)) async throws {
+        try await perform(deadline) {
+            if let expectedModel { _ = try self.validateLocked(expectedModel, deadline: deadline) }
             do {
-                return try await withCheckedThrowingContinuation { continuation in
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        do {
-                            let response = try self.sendSynchronously(method: method, params: params)
-                            continuation.resume(returning: response)
-                        } catch {
-                            continuation.resume(throwing: error)
-                        }
-                    }
+                // 控制命令最多发送一次；不确定是否执行时优先查询实际状态。
+                let payload = try self.sendSynchronously(method: "set_properties", params: [["siid": 2, "piid": 1, "value": on]], deadline: deadline)
+                guard Self.isSuccessfulSetPropertiesResult(payload["result"]) else {
+                    throw MiotLocalError.invalidResponse("开关命令未返回有效成功状态")
                 }
             } catch {
-                guard attempt < 2, Self.isRetryable(error) else { throw error }
-                let delay = UInt64(150_000_000) << UInt64(attempt)
-                try await Task.sleep(nanoseconds: delay)
-                attempt += 1
+                let original = error
+                try deadline.check("确认插座写入结果")
+                self.resetSession()
+                let actual = try? self.power(self.requestRead("get_properties", params: [["siid": 2, "piid": 1]], deadline: deadline))
+                guard actual == on else { throw original }
             }
         }
     }
 
-    private static func isRetryable(_ error: Error) -> Bool {
-        switch error {
-        case MiotLocalError.receiveTimedOut,
-             MiotLocalError.socketCreationFailed,
-             MiotLocalError.socketConnectionFailed,
-             MiotLocalError.sendFailed:
-            return true
-        default:
-            return false
-        }
+    private func perform<T: Sendable>(_ deadline: RecoveryDeadline, _ operation: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                queue.async {
+                    do {
+                        try deadline.check()
+                        let value = try operation()
+                        try deadline.check()
+                        continuation.resume(returning: value)
+                    } catch { continuation.resume(throwing: error) }
+                }
+            }
+        } onCancel: { deadline.cancellation.cancel("插座操作已取消") }
     }
-
-    private func sendSynchronously(method: String, params: Any) throws -> [String: Any] {
-        lock.lock()
-        defer { lock.unlock() }
-
+    private func validateLocked(_ expected: String, deadline: RecoveryDeadline) throws -> MiotDeviceInfo {
+        try deadline.check()
+        if validatedModel == expected, deviceID != nil { return MiotDeviceInfo(model: expected) }
+        let info = try info(requestRead("miIO.info", params: [], deadline: deadline))
+        guard info.model == expected else { throw RecoveryError.plugModelMismatch(expected: expected, actual: info.model) }
+        validatedModel = info.model
+        return info
+    }
+    private func info(_ payload: [String: Any]) throws -> MiotDeviceInfo {
+        guard let result = firstResultDictionary(payload), let model = result["model"] as? String else {
+            throw MiotLocalError.invalidResponse("缺少 model")
+        }
+        return MiotDeviceInfo(model: model, firmwareVersion: result["fw_ver"] as? String, hardwareVersion: result["hw_ver"] as? String)
+    }
+    private func power(_ payload: [String: Any]) throws -> Bool {
+        guard let results = payload["result"] as? [[String: Any]], results.count == 1,
+              let result = results.first, let code = result["code"] as? NSNumber, code.intValue == 0,
+              let value = result["value"] as? Bool else { throw MiotLocalError.invalidResponse("开关状态缺失或读取失败") }
+        return value
+    }
+    private static func isSuccessfulSetPropertiesResult(_ value: Any?) -> Bool {
+        if let result = value as? [NSNumber] { return result.count == 1 && result[0].intValue == 0 }
+        if let result = value as? [[String: Any]], result.count == 1, let code = result[0]["code"] as? NSNumber { return code.intValue == 0 }
+        return false
+    }
+    private func resetSession() {
+        deviceID = nil; deviceTimeBase = nil; validatedModel = nil
+    }
+    private func requestRead(_ method: String, params: Any, deadline: RecoveryDeadline) throws -> [String: Any] {
+        for attempt in 0..<3 {
+            do { return try sendSynchronously(method: method, params: params, deadline: deadline) }
+            catch {
+                try deadline.check()
+                guard attempt < 2, let error = error as? MiotLocalError, error == .receiveTimedOut || error == .malformedPacket else { throw error }
+                resetSession()
+            }
+        }
+        throw MiotLocalError.receiveTimedOut
+    }
+    private func sendSynchronously(method: String, params: Any, deadline: RecoveryDeadline) throws -> [String: Any] {
+        try deadline.check()
         if deviceID == nil {
-            let hello = try sendPacket(Self.helloPacket())
-            guard hello.count >= 32,
-                  hello[0] == 0x21,
-                  hello[1] == 0x31 else {
-                throw MiotLocalError.malformedPacket
-            }
-            deviceID = hello.readUInt32BE(at: 8)
+            let hello = try sendPacket(Self.helloPacket(), deadline: deadline)
+            guard hello.count == 32, hello.readUInt16BE(at: 0) == 0x2131 else { throw MiotLocalError.malformedPacket }
+            let identity = hello.readUInt32BE(at: 8)
+            if let boundDeviceID, boundDeviceID != identity { throw MiotLocalError.invalidResponse("插座设备身份发生变化") }
+            boundDeviceID = identity; deviceID = identity
+            deviceTimeBase = hello.readUInt32BE(at: 12); localTimeBase = deadline.clock.monotonicNow
         }
-
-        let command: [String: Any] = [
-            "id": sequence,
-            "method": method,
-            "params": params
-        ]
+        let requestID = sequence
         sequence &+= 1
+        var command: [String: Any] = ["id": requestID, "method": method, "params": params]
+        if let params = params as? [[String: Any]], let deviceID {
+            command["params"] = params.map { item in var item = item; item["did"] = String(deviceID); return item }
+        }
         let json = try JSONSerialization.data(withJSONObject: command, options: [.sortedKeys])
-        let packet = try makePacket(payload: json, deviceID: deviceID ?? 0)
-        let response = try sendPacket(packet)
-        return try decodeResponse(response)
-    }
-
-    private func sendPacket(_ packet: Data) throws -> Data {
-        let socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard socketFD >= 0 else {
-            throw MiotLocalError.socketCreationFailed(String(cString: strerror(errno)))
+        let packet = try makePacket(payload: json, deviceID: deviceID ?? 0, now: deadline.clock.monotonicNow)
+        let response = try sendPacket(packet, deadline: deadline)
+        let result = try decodeResponse(response)
+        guard let responseID = result["id"] as? NSNumber, responseID.uint32Value == requestID else {
+            throw MiotLocalError.invalidResponse("响应缺少匹配的请求编号")
         }
-        defer { close(socketFD) }
-
-        var timeout = timeval(tv_sec: 3, tv_usec: 0)
-        setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-
+        guard response.readUInt32BE(at: 8) == deviceID else { throw MiotLocalError.invalidResponse("响应设备编号不匹配") }
+        deviceTimeBase = response.readUInt32BE(at: 12); localTimeBase = deadline.clock.monotonicNow
+        return result
+    }
+    private func sendPacket(_ packet: Data, deadline: RecoveryDeadline) throws -> Data {
+        try deadline.check("插座 UDP 通信")
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { throw MiotLocalError.socketCreationFailed(String(cString: strerror(errno))) }
+        defer { close(fd) }
+        guard fcntl(fd, F_SETFL, O_NONBLOCK) == 0 else { throw MiotLocalError.socketCreationFailed(String(cString: strerror(errno))) }
         var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = port.bigEndian
-        guard inet_pton(AF_INET, host, &address.sin_addr) == 1 else {
-            throw MiotLocalError.invalidHost
-        }
-
-        let connected = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, host, &address.sin_addr) == 1 else { throw MiotLocalError.invalidHost }
+        let connected = withUnsafePointer(to: &address) { ptr in ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard connected == 0 else { throw MiotLocalError.socketConnectionFailed(String(cString: strerror(errno))) }
+        try deadline.check("发送插座命令")
+        let sent = packet.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
+        guard sent == packet.count else { throw MiotLocalError.sendFailed(String(cString: strerror(errno))) }
+        let responseDeadline = min(deadline.expiresAt, deadline.clock.monotonicNow + 3)
+        while deadline.clock.monotonicNow < responseDeadline {
+            try deadline.check("等待插座应答")
+            var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let milliseconds = Int32(max(1, min(50, (responseDeadline - deadline.clock.monotonicNow) * 1000)))
+            let ready = poll(&descriptor, 1, milliseconds)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                throw MiotLocalError.sendFailed(String(cString: strerror(errno)))
             }
-        }
-        guard connected == 0 else {
-            throw MiotLocalError.socketConnectionFailed(String(cString: strerror(errno)))
-        }
-
-        let sent = packet.withUnsafeBytes { buffer in
-            Darwin.send(socketFD, buffer.baseAddress, buffer.count, 0)
-        }
-        guard sent == packet.count else {
-            throw MiotLocalError.sendFailed(String(cString: strerror(errno)))
-        }
-
-        var response = Data(count: 4096)
-        let received = response.withUnsafeMutableBytes { buffer in
-            Darwin.recv(socketFD, buffer.baseAddress, buffer.count, 0)
-        }
-        if received < 0 {
-            if errno == EAGAIN || errno == EWOULDBLOCK {
-                throw MiotLocalError.receiveTimedOut
+            if ready == 0 { continue }
+            var response = Data(count: 4096)
+            let count = response.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress, $0.count, 0) }
+            if count < 0 {
+                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                throw MiotLocalError.sendFailed(String(cString: strerror(errno)))
             }
-            throw MiotLocalError.sendFailed(String(cString: strerror(errno)))
+            response.removeSubrange(count..<response.count)
+            try deadline.check("等待插座应答")
+            return response
         }
-        response.removeSubrange(received..<response.count)
-        return response
+        throw MiotLocalError.receiveTimedOut
     }
 
-    private func makePacket(payload: Data, deviceID: UInt32) throws -> Data {
+    private func makePacket(payload: Data, deviceID: UInt32, now: TimeInterval) throws -> Data {
         let encrypted = try Self.encrypt(payload, token: token)
         let packetLength = 32 + encrypted.count
         guard packetLength <= Int(UInt16.max) else { throw MiotLocalError.malformedPacket }
+
+        let elapsed = UInt32(max(0, now - localTimeBase))
+        let timestamp = (deviceTimeBase ?? UInt32(Date().timeIntervalSince1970)) &+ elapsed
 
         var packet = Data()
         packet.appendUInt16BE(0x2131)
         packet.appendUInt16BE(UInt16(packetLength))
         packet.appendUInt32BE(0)
         packet.appendUInt32BE(deviceID)
-        packet.appendUInt32BE(UInt32(Date().timeIntervalSince1970))
+        packet.appendUInt32BE(timestamp)
         packet.append(contentsOf: repeatElement(0, count: 16))
         packet.append(encrypted)
 
@@ -294,7 +277,10 @@ public final class MiotLocalClient: @unchecked Sendable {
     }
 
     private func firstResultDictionary(_ payload: [String: Any]) -> [String: Any]? {
-        (payload["result"] as? [[String: Any]])?.first
+        if let dict = payload["result"] as? [String: Any] {
+            return dict
+        }
+        return (payload["result"] as? [[String: Any]])?.first
     }
 
     private static func helloPacket() -> Data {
@@ -331,7 +317,7 @@ public final class MiotLocalClient: @unchecked Sendable {
     private static func encrypt(_ plaintext: Data, token: Data) throws -> Data {
         let key = md5(token)
         var ivInput = Data()
-        ivInput.append(md5(key))
+        ivInput.append(key)
         ivInput.append(token)
         let iv = md5(ivInput)
         return try crypt(operation: CCOperation(kCCEncrypt), input: plaintext, key: key, iv: iv)
@@ -340,7 +326,7 @@ public final class MiotLocalClient: @unchecked Sendable {
     private static func decrypt(_ ciphertext: Data, token: Data) throws -> Data {
         let key = md5(token)
         var ivInput = Data()
-        ivInput.append(md5(key))
+        ivInput.append(key)
         ivInput.append(token)
         let iv = md5(ivInput)
         return try crypt(operation: CCOperation(kCCDecrypt), input: ciphertext, key: key, iv: iv)

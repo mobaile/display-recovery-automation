@@ -6,6 +6,13 @@ import DisplayRecoveryMac
 @main
 @MainActor
 final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = DisplayRecoveryAppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+
     private let model = AppModel()
     private var statusItem: NSStatusItem!
     private var menu = NSMenu()
@@ -31,6 +38,14 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
         observation?.cancel()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await model.shutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     @objc private func openPanel() {
         if panelController == nil {
             panelController = RecoveryPanelController(model: model)
@@ -48,6 +63,11 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
         model.triggerRecovery()
     }
 
+    @objc private func clearStop() {
+        model.clearStop()
+    }
+    @objc private func cancelRecovery() { model.cancelRecovery() }
+
     @objc private func refresh() {
         Task { @MainActor in await model.refresh() }
     }
@@ -60,11 +80,27 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(title)
         menu.addItem(.separator())
 
-        let status = NSMenuItem(title: model.recoveryStatus.message, action: nil, keyEquivalent: "")
+        let stageStr = model.recoveryStatus.stage.rawValue
+        let attemptStr = model.recoveryStatus.attemptCount > 0 ? " (尝试 \(model.recoveryStatus.attemptCount)/3)" : ""
+        let statusTitle = "[\(stageStr)] \(model.recoveryStatus.message)\(attemptStr)"
+        let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+
+        if model.recoveryStatus.modePending4K {
+            let pending4K = NSMenuItem(title: "责任：待恢复到 4K", action: nil, keyEquivalent: "")
+            pending4K.isEnabled = false
+            menu.addItem(pending4K)
+        }
+
+        if model.recoveryStatus.isStopped {
+            let stopped = NSMenuItem(title: "已停止：\(model.recoveryStatus.stopReason ?? "等待手动恢复")", action: nil, keyEquivalent: "")
+            stopped.isEnabled = false
+            menu.addItem(stopped)
+        }
+
         if let error = model.recoveryStatus.lastError ?? model.lastError {
-            let errorItem = NSMenuItem(title: "最近失败：\(error)", action: nil, keyEquivalent: "")
+            let errorItem = NSMenuItem(title: "最近异常：\(error)", action: nil, keyEquivalent: "")
             errorItem.isEnabled = false
             menu.addItem(errorItem)
         }
@@ -79,7 +115,8 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
                     ? "显示器 \(snapshot.displayID)"
                     : snapshot.fingerprint.displayName
                 let mode = snapshot.mode?.shortDescription ?? "未知模式"
-                let item = NSMenuItem(title: "显示器：\(name) · \(mode)", action: nil, keyEquivalent: "")
+                let builtinTag = snapshot.isBuiltin ? " [内置]" : ""
+                let item = NSMenuItem(title: "显示器：\(name)\(builtinTag) · \(mode)", action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 menu.addItem(item)
             }
@@ -90,7 +127,7 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(plug)
 
         let hid = NSMenuItem(
-            title: "MSI HID：\(model.msiStatus?.connected == true ? "已连接" : "未连接")",
+            title: "MSI HID：\(model.msiStatus?.connected == true ? "已连接" : "未连接") · 模式：\(model.msiStatus?.mode.rawValue ?? "未知")",
             action: nil,
             keyEquivalent: ""
         )
@@ -107,6 +144,18 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
         recover.target = self
         recover.isEnabled = !model.recoveryStatus.recoveryInProgress
         menu.addItem(recover)
+
+        if model.recoveryStatus.recoveryInProgress {
+            let cancel = NSMenuItem(title: "取消恢复并收尾", action: #selector(cancelRecovery), keyEquivalent: "")
+            cancel.target = self
+            menu.addItem(cancel)
+        }
+
+        if model.recoveryStatus.isStopped {
+            let clearStopItem = NSMenuItem(title: "解除停止状态", action: #selector(clearStop), keyEquivalent: "")
+            clearStopItem.target = self
+            menu.addItem(clearStopItem)
+        }
 
         let panel = NSMenuItem(title: "打开控制面板…", action: #selector(openPanel), keyEquivalent: ",")
         panel.target = self
@@ -137,11 +186,13 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
     private let modelField = NSTextField(string: "")
     private let tokenField = NSSecureTextField(string: "")
     private let automaticButton = NSButton(checkboxWithTitle: "自动恢复", target: nil, action: nil)
+    private let clearStopButton = NSButton(title: "解除停止", target: nil, action: nil)
+    private var isDraftInitialized = false
 
     init(model: AppModel) {
         self.model = model
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 530),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -151,6 +202,7 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
         super.init(window: window)
         window.delegate = self
         buildView()
+        initDraftFields()
         refresh()
     }
 
@@ -159,20 +211,33 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
 
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender)
+        initDraftFields()
         refresh()
     }
 
+    private func initDraftFields() {
+        guard !isDraftInitialized else { return }
+        hostField.stringValue = model.appConfiguration.plug.host
+        modelField.stringValue = model.appConfiguration.plug.model
+        tokenField.stringValue = ""
+        isDraftInitialized = true
+    }
+
     func refresh() {
-        statusLabel.stringValue = "状态：\(model.recoveryStatus.message)"
-        errorLabel.stringValue = (model.recoveryStatus.lastError ?? model.lastError).map { "最近失败：\($0)" } ?? ""
+        let stageStr = model.recoveryStatus.stage.rawValue
+        let attemptStr = model.recoveryStatus.attemptCount > 0 ? " · 尝试 \(model.recoveryStatus.attemptCount)/3" : ""
+        let stoppedStr = model.recoveryStatus.isStopped ? " 【已停止】" : ""
+        let pending4KStr = model.recoveryStatus.modePending4K ? " 【待恢复到 4K】" : ""
+
+        statusLabel.stringValue = "阶段：[\(stageStr)] \(model.recoveryStatus.message)\(attemptStr)\(stoppedStr)\(pending4KStr)"
+        errorLabel.stringValue = (model.recoveryStatus.lastError ?? model.lastError).map { "异常信息：\($0)" } ?? ""
         displaysLabel.stringValue = displaySummary()
         rebuildRoleButtons()
         rolesLabel.stringValue = "插座屏：\(model.roleName(.powerControlled))\n模式屏：\(model.roleName(.modeSwitch))"
         plugLabel.stringValue = "插座：\(model.plugStateText)"
         hidLabel.stringValue = "MSI HID：\(model.msiStatus?.connected == true ? "已连接" : "未连接") · 模式：\(model.msiStatus?.mode.rawValue ?? "未知")"
-        hostField.stringValue = model.appConfiguration.plug.host
-        modelField.stringValue = model.appConfiguration.plug.model
         automaticButton.state = model.automaticRecoveryEnabled ? .on : .off
+        clearStopButton.isHidden = !model.recoveryStatus.isStopped
     }
 
     private func rebuildRoleButtons() {
@@ -190,7 +255,8 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
             let name = snapshot.fingerprint.displayName.isEmpty
                 ? "显示器 \(snapshot.displayID)"
                 : snapshot.fingerprint.displayName
-            let label = NSTextField(labelWithString: name)
+            let builtinTag = snapshot.isBuiltin ? " [内置]" : ""
+            let label = NSTextField(labelWithString: "\(name)\(builtinTag)")
             label.font = .systemFont(ofSize: 11)
             label.widthAnchor.constraint(equalToConstant: 210).isActive = true
             row.addArrangedSubview(label)
@@ -199,12 +265,14 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
             power.tag = Int(snapshot.displayID)
             power.bezelStyle = .rounded
             power.controlSize = .small
+            power.isEnabled = !snapshot.isBuiltin
             row.addArrangedSubview(power)
 
             let mode = NSButton(title: "设为模式屏", target: self, action: #selector(assignModeDisplay(_:)))
             mode.tag = Int(snapshot.displayID)
             mode.bezelStyle = .rounded
             mode.controlSize = .small
+            mode.isEnabled = !snapshot.isBuiltin
             row.addArrangedSubview(mode)
             roleButtonsStack.addArrangedSubview(row)
         }
@@ -217,7 +285,8 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
                 ? "显示器 \(snapshot.displayID)"
                 : snapshot.fingerprint.displayName
             let mode = snapshot.mode?.shortDescription ?? "未知模式"
-            return "显示器：\(name) · \(mode)"
+            let builtin = snapshot.isBuiltin ? " (内置屏)" : ""
+            return "显示器：\(name)\(builtin) · \(mode)"
         }.joined(separator: "\n")
     }
 
@@ -245,7 +314,7 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
         configurationBox.orientation = .vertical
         configurationBox.alignment = .leading
         configurationBox.spacing = 6
-        let boxTitle = NSTextField(labelWithString: "插座配置（token 仅保存到 Keychain）")
+        let boxTitle = NSTextField(labelWithString: "插座配置（Token 存储在本地 secrets.json 且权限 0600）")
         boxTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         configurationBox.addArrangedSubview(boxTitle)
         configurationBox.addArrangedSubview(labeledField("型号", field: modelField))
@@ -253,9 +322,19 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
         configurationBox.addArrangedSubview(labeledField("Token", field: tokenField))
         stack.addArrangedSubview(configurationBox)
 
+        let optionRow = NSStackView()
+        optionRow.spacing = 12
         automaticButton.target = self
         automaticButton.action = #selector(toggleAutomatic)
-        stack.addArrangedSubview(automaticButton)
+        optionRow.addArrangedSubview(automaticButton)
+
+        clearStopButton.target = self
+        clearStopButton.action = #selector(clearStopClicked)
+        clearStopButton.bezelStyle = .rounded
+        clearStopButton.contentTintColor = .systemRed
+        clearStopButton.isHidden = true
+        optionRow.addArrangedSubview(clearStopButton)
+        stack.addArrangedSubview(optionRow)
 
         let actions = NSStackView()
         actions.spacing = 8
@@ -265,16 +344,23 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
         recover.bezelStyle = .rounded
         let refreshButton = NSButton(title: "刷新", target: self, action: #selector(refreshNow))
         refreshButton.bezelStyle = .rounded
+        let importKeyBtn = NSButton(title: "从 Keychain 导入", target: self, action: #selector(importKeychain))
+        importKeyBtn.bezelStyle = .rounded
         let exportButton = NSButton(title: "导出脱敏日志", target: self, action: #selector(exportLog))
         exportButton.bezelStyle = .rounded
         let deleteTokenButton = NSButton(title: "删除 Token", target: self, action: #selector(deleteToken))
         deleteTokenButton.bezelStyle = .rounded
+
         actions.addArrangedSubview(save)
         actions.addArrangedSubview(recover)
+        let cancel = NSButton(title: "取消并收尾", target: self, action: #selector(cancelRecoveryClicked))
+        cancel.bezelStyle = .rounded
+        actions.addArrangedSubview(cancel)
         actions.addArrangedSubview(refreshButton)
-        actions.addArrangedSubview(exportButton)
-        actions.addArrangedSubview(deleteTokenButton)
         stack.addArrangedSubview(actions)
+        let secondaryActions = NSStackView(views: [importKeyBtn, exportButton, deleteTokenButton])
+        secondaryActions.spacing = 8
+        stack.addArrangedSubview(secondaryActions)
 
         contentView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -304,6 +390,16 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
         model.automaticRecoveryEnabled = automaticButton.state == .on
     }
 
+    @objc private func clearStopClicked() {
+        model.clearStop()
+    }
+
+    @objc private func importKeychain() {
+        model.importLegacyKeychainToken()
+        initDraftFields()
+        refresh()
+    }
+
     @objc private func assignPowerDisplay(_ sender: NSButton) {
         guard let snapshot = model.snapshots.first(where: { Int($0.displayID) == sender.tag }) else { return }
         model.useAsPowerControlled(snapshot)
@@ -317,13 +413,13 @@ private final class RecoveryPanelController: NSWindowController, NSWindowDelegat
     }
 
     @objc private func saveSettings() {
-        model.appConfiguration.plug.model = modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        model.appConfiguration.plug.host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        model.tokenInput = tokenField.stringValue
-        model.saveConfiguration()
-        tokenField.stringValue = ""
+        model.saveSettings(model: modelField.stringValue, host: hostField.stringValue, token: tokenField.stringValue) { [weak self] succeeded in
+            if succeeded { self?.tokenField.stringValue = "" }
+        }
         refresh()
     }
+
+    @objc private func cancelRecoveryClicked() { model.cancelRecovery() }
 
     @objc private func triggerRecovery() {
         model.triggerRecovery()

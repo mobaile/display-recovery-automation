@@ -1,155 +1,98 @@
 import Foundation
 import IOKit.hid
-
 import DisplayRecoveryCore
 
-public enum MsiDualMode: String, Codable, Sendable {
-    case uhd
-    case fhd
-    case unknown
-
-    public var displayMode: DisplayModeSignature {
-        switch self {
-        case .uhd:
-            // 002E0 只表示 UHD 双模式，实际刷新率由显示器当前枚举结果提供。
-            return DisplayModeSignature(width: 3840, height: 2160, refreshRate: 0)
-        case .fhd:
-            return DisplayModeSignature(width: 1920, height: 1080, refreshRate: 320)
-        case .unknown:
-            return DisplayModeSignature(width: 0, height: 0, refreshRate: 0)
-        }
-    }
-}
+public typealias MsiDualMode = MsiHardwareDualMode
 
 public struct MsiHidStatus: Sendable {
     public let connected: Bool
-    public let mode: MsiDualMode
+    public let isAmbiguous: Bool
+    public let mode: MsiHardwareDualMode
     public let rawMode: String
     public let rawConfirmation: String
     public let rawInputSource: String
+    public let identity: String?
+    public let observedAt: TimeInterval
+    public init(connected: Bool, isAmbiguous: Bool = false, mode: MsiHardwareDualMode = .unknown,
+                rawMode: String = "NO_RESPONSE", rawConfirmation: String = "NO_RESPONSE", rawInputSource: String = "NO_RESPONSE",
+                identity: String? = nil, observedAt: TimeInterval = SystemRecoveryClock().monotonicNow) {
+        self.connected = connected; self.isAmbiguous = isAmbiguous; self.mode = mode
+        self.rawMode = rawMode; self.rawConfirmation = rawConfirmation; self.rawInputSource = rawInputSource
+        self.identity = identity; self.observedAt = observedAt
+    }
+}
 
-    public init(
-        connected: Bool,
-        mode: MsiDualMode,
-        rawMode: String,
-        rawConfirmation: String,
-        rawInputSource: String
-    ) {
-        self.connected = connected
-        self.mode = mode
-        self.rawMode = rawMode
-        self.rawConfirmation = rawConfirmation
-        self.rawInputSource = rawInputSource
+/// 已由现场记录验证的响应形式：5b + 五位寄存器 + 三位值。
+public enum MsiHidProtocol {
+    public static func value(in response: String, register: String) -> String? {
+        let text = response.uppercased()
+        guard text.count == 10, text.hasPrefix("5B" + register.uppercased()) else { return nil }
+        let value = String(text.suffix(3))
+        guard value.utf8.allSatisfy({ (48...57).contains($0) }) else { return nil }
+        return value
+    }
+    public static func mode(from response: String) -> MsiHardwareDualMode {
+        switch value(in: response, register: "002E0") {
+        case "000": return .uhd
+        case "001": return .fhd
+        default: return .unknown
+        }
     }
 }
 
 public final class MsiHidController: @unchecked Sendable {
-    private enum Register {
-        static let mode = "002E0"
-        static let confirmation = "00190"
-        static let inputSource = "00500"
-    }
-
+    // 所有实例共用通道，UI 与恢复不能各自创建可并发写入的串行队列。
+    private static let serialQueue = DispatchQueue(label: "local.codex.msihid.serial")
+    private let cacheLock = NSLock()
+    private var lastCachedStatus = MsiHidStatus(connected: false)
     public init() {}
+    public func cachedStatus() -> MsiHidStatus { cacheLock.withLock { lastCachedStatus } }
 
-    public func readStatus(retries: Int = 2) -> MsiHidStatus {
-        var best: [String: String] = [:]
-
-        for attempt in 0...max(0, retries) {
-            if attempt > 0 {
-                Thread.sleep(forTimeInterval: 0.45)
-            }
-
-            let status = readOnce()
-            if status.connected {
-                best["connected"] = "1"
-            } else if best["connected"] == nil {
-                best["connected"] = "0"
-            }
-
-            for (key, value) in [
-                (Register.mode, status.rawMode),
-                (Register.confirmation, status.rawConfirmation),
-                (Register.inputSource, status.rawInputSource)
-            ] where value != "NO_RESPONSE" || best[key] == nil {
-                best[key] = value
-            }
-
-            if best["connected"] == "1",
-               best[Register.mode] != nil,
-               best[Register.mode] != "NO_RESPONSE",
-               best[Register.confirmation] != nil,
-               best[Register.confirmation] != "NO_RESPONSE",
-               best[Register.inputSource] != nil,
-               best[Register.inputSource] != "NO_RESPONSE" {
-                break
-            }
+    public func readStatus(retries: Int = 0) -> MsiHidStatus {
+        Self.serialQueue.sync {
+            (try? readOnce(deadline: RecoveryDeadline(seconds: 3))) ?? MsiHidStatus(connected: false)
         }
-
-        let rawMode = best[Register.mode] ?? "NO_RESPONSE"
-        let rawConfirmation = best[Register.confirmation] ?? "NO_RESPONSE"
-        let rawInputSource = best[Register.inputSource] ?? "NO_RESPONSE"
-        return MsiHidStatus(
-            connected: best["connected"] == "1",
-            mode: decodeMode(rawMode: rawMode, rawConfirmation: rawConfirmation),
-            rawMode: rawMode,
-            rawConfirmation: rawConfirmation,
-            rawInputSource: rawInputSource
-        )
     }
-
-    @discardableResult
-    public func setMode(_ mode: MsiDualMode) -> Bool {
-        let value: String
-        switch mode {
-        case .uhd:
-            value = "000"
-        case .fhd:
-            value = "001"
-        case .unknown:
-            return false
-        }
-
-        // 某些固件接受写入后不会返回确认报文；实际是否生效由恢复状态机
-        // 继续读取显示器模式确认，这里只报告 IOHIDDeviceSetReport 的结果。
-        for attempt in 0...2 {
-            if attempt > 0 {
-                Thread.sleep(forTimeInterval: 0.2 * Double(attempt))
-            }
-            guard let session = HIDSession() else { continue }
-            if session.write("5b002E0\(value)", settleSeconds: 0.35) {
-                return true
-            }
-        }
-        return false
+    public func readStatus(deadline: RecoveryDeadline) async throws -> MsiHidStatus {
+        try await perform { try self.readOnce(deadline: deadline) }
     }
-
-    private func readOnce() -> MsiHidStatus {
+    public func setMode(_ mode: MsiHardwareDualMode, expectedIdentity: String, deadline: RecoveryDeadline) async throws {
+        try await perform {
+            try deadline.check("MSI 模式写入")
+            guard mode != .unknown, let session = HIDSession() else { throw RecoveryError.monitorUnavailable }
+            guard !session.isAmbiguous, session.identity == expectedIdentity else {
+                throw RecoveryError.ambiguousDisplay("MSI HID 写入目标不一致")
+            }
+            try session.write("5b002E0" + (mode == .uhd ? "000" : "001"), deadline: deadline)
+            // 仅代表指令已发出；确认由独立读回完成，不能编造成功缓存。
+            self.cacheLock.withLock { self.lastCachedStatus = MsiHidStatus(connected: true, identity: session.identity) }
+        }
+    }
+    private func readOnce(deadline: RecoveryDeadline) throws -> MsiHidStatus {
+        try deadline.check("MSI HID 读取")
         guard let session = HIDSession() else {
-            return MsiHidStatus(
-                connected: false,
-                mode: .unknown,
-                rawMode: "NO_RESPONSE",
-                rawConfirmation: "NO_RESPONSE",
-                rawInputSource: "NO_RESPONSE"
-            )
+            let status = MsiHidStatus(connected: false)
+            cacheLock.withLock { lastCachedStatus = status }
+            return status
         }
-
-        return MsiHidStatus(
-            connected: true,
-            mode: .unknown,
-            rawMode: session.send("58002E0", waitSeconds: 0.25) ?? "NO_RESPONSE",
-            rawConfirmation: session.send("5800190", waitSeconds: 0.25) ?? "NO_RESPONSE",
-            rawInputSource: session.send("5800500", waitSeconds: 0.25) ?? "NO_RESPONSE"
-        )
+        if session.isAmbiguous {
+            let status = MsiHidStatus(connected: false, isAmbiguous: true)
+            cacheLock.withLock { lastCachedStatus = status }
+            return status
+        }
+        let raw = try session.send("58002E0", expectedRegister: "002E0", deadline: deadline) ?? "NO_RESPONSE"
+        let status = MsiHidStatus(connected: true, mode: MsiHidProtocol.mode(from: raw), rawMode: raw,
+                                  identity: session.identity, observedAt: deadline.clock.monotonicNow)
+        cacheLock.withLock { lastCachedStatus = status }
+        return status
     }
-
-    private func decodeMode(rawMode: String, rawConfirmation: String) -> MsiDualMode {
-        if rawMode.hasSuffix("000") { return .uhd }
-        if rawMode.hasSuffix("001") { return .fhd }
-        if rawConfirmation.hasSuffix("001") { return .uhd }
-        if rawConfirmation.hasSuffix("000") { return .fhd }
-        return .unknown
+    private func perform<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            Self.serialQueue.async {
+                do { continuation.resume(returning: try operation()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
     }
 }
 
@@ -169,10 +112,10 @@ private final class HIDReportSink {
         lock.unlock()
     }
 
-    var firstReport: [UInt8]? {
+    func reports() -> [[UInt8]] {
         lock.lock()
         defer { lock.unlock() }
-        return storedReports.first
+        return storedReports
     }
 }
 
@@ -180,9 +123,11 @@ private final class HIDSession {
     private let reportID: CFIndex = 0x01
     private let reportLength = 64
     private let manager: IOHIDManager
-    private let device: IOHIDDevice
+    private let device: IOHIDDevice?
     private let sink = HIDReportSink()
-    private let buffer: UnsafeMutablePointer<UInt8>
+    private let buffer: UnsafeMutablePointer<UInt8>?
+    public private(set) var isAmbiguous: Bool = false
+    private(set) var identity: String?
 
     init?() {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -192,70 +137,112 @@ private final class HIDSession {
         ] as CFDictionary)
 
         guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess,
-              let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
-              let firstDevice = devices.first,
+              let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
+            return nil
+        }
+
+        if devices.count > 1 {
+            self.isAmbiguous = true
+            self.device = nil
+            self.buffer = nil
+            return
+        }
+
+        guard let firstDevice = devices.first,
               IOHIDDeviceOpen(firstDevice, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
             return nil
         }
 
-        device = firstDevice
-        buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: reportLength)
-        buffer.initialize(repeating: 0, count: reportLength)
+        self.device = firstDevice
+        let serial = IOHIDDeviceGetProperty(firstDevice, kIOHIDSerialNumberKey as CFString) as? String
+        let location = IOHIDDeviceGetProperty(firstDevice, kIOHIDLocationIDKey as CFString) as? NSNumber
+        if let serial, !serial.isEmpty { identity = "1462:3fa4:serial:" + serial }
+        else if let location { identity = "1462:3fa4:location:" + location.stringValue }
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: reportLength)
+        buf.initialize(repeating: 0, count: reportLength)
+        self.buffer = buf
 
         let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(sink).toOpaque())
-        IOHIDDeviceRegisterInputReportCallback(device, buffer, reportLength, { context, _, _, _, _, report, length in
+        IOHIDDeviceRegisterInputReportCallback(firstDevice, buf, reportLength, { context, _, _, _, _, report, length in
             guard let context else { return }
             let sink = Unmanaged<HIDReportSink>.fromOpaque(context).takeUnretainedValue()
             sink.append(Array(UnsafeBufferPointer(start: report, count: length)))
         }, context)
-        IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDDeviceScheduleWithRunLoop(firstDevice, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
     }
 
     deinit {
-        IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
-        IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        if let device {
+            IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
         IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        buffer.deinitialize(count: reportLength)
-        buffer.deallocate()
-    }
-
-    func send(_ asciiCommand: String, waitSeconds: Double) -> String? {
-        guard write(asciiCommand) else { return nil }
-
-        CFRunLoopRunInMode(CFRunLoopMode.defaultMode, waitSeconds, false)
-        guard let report = sink.firstReport,
-              let terminator = report.firstIndex(of: 0x0D),
-              terminator > 1 else {
-            return nil
+        if let buffer {
+            buffer.deinitialize(count: reportLength)
+            buffer.deallocate()
         }
-        return String(bytes: report[1..<terminator], encoding: .utf8)
     }
 
-    func write(_ asciiCommand: String, settleSeconds: Double = 0) -> Bool {
+    func send(_ asciiCommand: String, expectedRegister: String, deadline: RecoveryDeadline) throws -> String? {
+        try write(asciiCommand, deadline: deadline)
+        let end = min(deadline.expiresAt, deadline.clock.monotonicNow + 0.3)
+        repeat {
+            try deadline.check("等待 MSI HID 应答")
+            CFRunLoopRunInMode(CFRunLoopMode.defaultMode, min(0.01, deadline.remaining), false)
+            for report in sink.reports() {
+                guard report.first == UInt8(reportID), let terminator = report.firstIndex(of: 0x0D), terminator > 1,
+                      let text = String(bytes: report[1..<terminator], encoding: .utf8),
+                      MsiHidProtocol.value(in: text, register: expectedRegister) != nil else { continue }
+                return text
+            }
+        } while deadline.clock.monotonicNow < end
+        return nil
+    }
+
+    func write(_ asciiCommand: String, deadline: RecoveryDeadline) throws {
+        guard let device else { throw RecoveryError.monitorUnavailable }
+        try deadline.check("发送 MSI HID 报告")
         sink.clear()
-        CFRunLoopRunInMode(CFRunLoopMode.defaultMode, 0.03, false)
+        // 清空上一请求的剩余输入，等待也计入同一个 deadline。
+        CFRunLoopRunInMode(CFRunLoopMode.defaultMode, min(0.03, deadline.remaining), false)
         sink.clear()
-
-        var output = [UInt8](repeating: 0, count: reportLength)
-        output[0] = UInt8(reportID)
-        let commandBytes = Array((asciiCommand + "\r").utf8)
-        for (index, byte) in commandBytes.enumerated() where index + 1 < output.count {
-            output[index + 1] = byte
+        try deadline.check("发送 MSI HID 报告")
+        let request = HIDOutputRequest(command: asciiCommand, reportID: UInt8(reportID), length: reportLength)
+        let context = Unmanaged.passRetained(request).toOpaque()
+        // SDK 将此参数定义为毫秒；异步接口避免同步 SetReport 阻塞执行器。
+        let result = IOHIDDeviceSetReportWithCallback(device, kIOHIDReportTypeOutput, reportID,
+            request.bytes, reportLength, min(1000, deadline.remaining * 1000), { context, result, _, _, _, _, _ in
+                guard let context else { return }
+                let request = Unmanaged<HIDOutputRequest>.fromOpaque(context).takeRetainedValue()
+                request.finish(result)
+            }, context)
+        guard result == kIOReturnSuccess else {
+            Unmanaged<HIDOutputRequest>.fromOpaque(context).release()
+            throw RecoveryError.operationFailed("HID 报告提交失败：\(result)")
         }
-
-        let result = output.withUnsafeBytes {
-            IOHIDDeviceSetReport(
-                device,
-                kIOHIDReportTypeOutput,
-                reportID,
-                $0.bindMemory(to: UInt8.self).baseAddress!,
-                reportLength
-            )
+        // 请求对象自行保有报告内存，超时后的迟到回调不会访问已释放的缓冲区。
+        while request.result == nil {
+            try deadline.check("MSI HID 报告传输")
+            CFRunLoopRunInMode(CFRunLoopMode.defaultMode, min(0.01, deadline.remaining), false)
         }
-        guard result == kIOReturnSuccess else { return false }
-        if settleSeconds > 0 {
-            CFRunLoopRunInMode(CFRunLoopMode.defaultMode, settleSeconds, false)
+        guard request.result == kIOReturnSuccess else {
+            throw RecoveryError.operationFailed("HID 报告传输失败：\(request.result ?? kIOReturnError)")
         }
-        return true
+        try deadline.check("MSI HID 报告传输")
     }
+}
+
+private final class HIDOutputRequest {
+    let bytes: UnsafeMutablePointer<UInt8>
+    private let lock = NSLock()
+    private var completion: IOReturn?
+    var result: IOReturn? { lock.withLock { completion } }
+    init(command: String, reportID: UInt8, length: Int) {
+        bytes = .allocate(capacity: length)
+        bytes.initialize(repeating: 0, count: length)
+        bytes[0] = reportID
+        for (i, byte) in (command + "\r").utf8.enumerated() where i + 1 < length { bytes[i + 1] = byte }
+    }
+    func finish(_ result: IOReturn) { lock.withLock { completion = result } }
+    deinit { bytes.deallocate() }
 }

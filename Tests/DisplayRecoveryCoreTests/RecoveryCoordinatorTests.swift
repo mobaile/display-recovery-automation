@@ -1,269 +1,555 @@
+import Foundation
 import XCTest
 @testable import DisplayRecoveryCore
 
+private let antFingerprint = DisplayFingerprint(vendor: "ANT", model: "ANT27VU", serial: "ant")
+private let msiFingerprint = DisplayFingerprint(vendor: "MSI", model: "MPG 274U E16M", serial: "msi")
+private let uhd = DisplayModeSignature(width: 3840, height: 2160, refreshRate: 120)
+private let fhd = DisplayModeSignature(width: 1920, height: 1080, refreshRate: 320)
+private func ant() -> DisplaySnapshot { DisplaySnapshot(displayID: 10, fingerprint: antFingerprint, mode: uhd) }
+private func msi(_ mode: DisplayModeSignature? = uhd) -> DisplaySnapshot { DisplaySnapshot(displayID: 20, fingerprint: msiFingerprint, mode: mode) }
+private func configuration(automatic: Bool = true) -> RecoveryConfiguration {
+    RecoveryConfiguration(roles: DisplayRoleConfiguration(powerControlled: antFingerprint, modeSwitch: msiFingerprint),
+        recoveryCooldown: 0, pollInterval: 0.5,
+        timeouts: RecoveryTimeouts(powerOff: 2, newDisplayOnline: 2, safeMode: 2, powerOn: 2, oldDisplayOnline: 2, restoreMode: 2, dualDisplayStabilize: 10, singleDisplayObserve: 5),
+        automaticRecoveryEnabled: automatic)
+}
+private var target: RecoveryTarget { RecoveryTarget(roles: configuration().roles, controlIdentity: "plug-fixture") }
+
 final class RecoveryCoordinatorTests: XCTestCase {
-    private let oldFingerprint = DisplayFingerprint(vendor: "ANT", model: "ANT27VU", serial: "old")
-    private let newFingerprint = DisplayFingerprint(vendor: "MSI", model: "MPG 274U E16M", serial: "new")
-
-    func testNormalRecoveryRunsInOrderAndRestoresMode() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint, mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 60))],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144)
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration())
-
-        await coordinator.triggerManualRecovery()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .completed)
-        XCTAssertNil(status.lastError)
-        let calls = await io.calls
-        XCTAssertEqual(calls, ["plug:false", "safe", "plug:true", "restore:3840x2160@144.0"])
-        let finalMode = await io.mode
-        XCTAssertEqual(finalMode, DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144))
+    func testFailedCompletionCommitCannotEraseThirdAttempt() async throws {
+        let h = Harness(transaction: RecoveryTransaction(attemptCount: 2))
+        await h.store.setFailStage(.completed)
+        await h.poll(12)
+        let tx = try await h.store.load()
+        XCTAssertEqual(tx?.attemptCount, 3)
+        XCTAssertTrue(tx?.isStopped == true)
+        XCTAssertEqual(tx?.stage, .stopped)
     }
 
-    func testRepeatedDisplayEventsDoNotStartTwoRecoveries() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint)],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144)
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration(automatic: true))
-
-        await coordinator.notifyDisplaysChanged()
-        await coordinator.notifyDisplaysChanged()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .completed)
-        let calls = await io.calls
-        XCTAssertEqual(calls.filter { $0 == "plug:false" }.count, 1)
+    func testConcurrentStartupReadersShareInitializationWithoutOverwritingRecovery() async throws {
+        let h = Harness(transaction: RecoveryTransaction(attemptCount: 3, isStopped: true))
+        let gate = TestGate()
+        await h.store.setLoadGate(gate)
+        let status = Task { await h.coordinator.status() }
+        while !(await gate.entered) { await Task.yield() }
+        let recovery = Task { await h.coordinator.triggerManualRecovery() }
+        let secondStatus = Task { await h.coordinator.status() }
+        await gate.release()
+        _ = await status.value
+        _ = await secondStatus.value
+        let result = await recovery.value
+        XCTAssertEqual(result, .success)
+        let loads = await h.store.loadCount
+        XCTAssertEqual(loads, 2, "一次初始化，取得全局锁后再读取一次")
+        let tx = try await h.store.load()
+        XCTAssertFalse(tx?.isStopped ?? true)
+        XCTAssertEqual(tx?.stage, .completed)
     }
-
-    func testAmbiguousPowerDisplayDoesNotStartRecovery() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [
-                DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint),
-                DisplaySnapshot(displayID: 11, fingerprint: oldFingerprint)
-            ],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144)
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration(automatic: true))
-
-        await coordinator.notifyDisplaysChanged()
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        let status = await coordinator.status()
-
-        XCTAssertFalse(status.recoveryInProgress)
-        XCTAssertEqual(status.state, .idle)
-        let calls = await io.calls
+    func testMSIOnlyReturnsTo4KAndPersistsRealStages() async throws {
+        let h = Harness()
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(outcome, .success)
+        let calls = await h.io.writes
+        XCTAssertEqual(calls, ["mode:FHD", "mode:UHD"])
+        let tx = try await h.store.load()
+        XCTAssertEqual(tx?.stage, .completed)
+        XCTAssertFalse(tx?.hasPendingCleanup ?? true)
+        let history = await h.store.savedStages
+        XCTAssertTrue(history.contains(.msiSwitch1080P))
+        XCTAssertTrue(history.contains(.stabilizing4K))
+        XCTAssertEqual(tx?.msiHIDIdentity, "msi-usb-fixture")
+    }
+    func testANTReturningOnlyAfterUHDStillGetsFullStableVerification() async throws {
+        let h = Harness()
+        await h.io.setRevealANTOnFHD(false)
+        await h.io.setRevealANTOnUHD(true)
+        let result = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(result, .success)
+        let calls = await h.io.writes
+        let tx = try await h.store.load()
+        let stages = await h.store.savedStages
+        XCTAssertEqual(calls, ["mode:FHD", "mode:UHD"])
+        XCTAssertTrue(stages.contains(.stabilizing4K))
+        XCTAssertGreaterThanOrEqual(h.clock.monotonicNow, 12, "等待超时后仍须完整验证 10 秒")
+        XCTAssertEqual(tx?.stage, .completed)
+        XCTAssertFalse(tx?.hasPendingCleanup ?? true)
+    }
+    func testANTStillAbsentAfterUHDRemainsFailureWithoutRepeatedModeWrites() async throws {
+        let h = Harness()
+        await h.io.setRevealANTOnFHD(false)
+        let result = await h.coordinator.triggerManualRecovery()
+        XCTAssertNotEqual(result, .success)
+        let calls = await h.io.writes
+        let tx = try await h.store.load()
+        XCTAssertEqual(calls, ["mode:FHD", "mode:UHD"])
+        XCTAssertEqual(tx?.attemptCount, 1)
+        XCTAssertEqual(tx?.stage, .failed)
+        XCTAssertFalse(tx?.modePending4K ?? true)
+    }
+    func testANTNaturalReturnAtFHDStillRestores4K() async {
+        let h = Harness(snapshots: [ant()], hardware: .fhd)
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(outcome, .success)
+        let calls = await h.io.writes
+        XCTAssertEqual(calls, ["power:false", "power:true", "mode:UHD"])
+    }
+    func testANTNaturalReturnAtUHDDoesNotSendFHD() async {
+        let h = Harness(snapshots: [ant()])
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(outcome, .success)
+        let calls = await h.io.writes
+        XCTAssertEqual(calls, ["power:false", "power:true"])
+    }
+    func testANTFallbackRemainsOneAttempt() async throws {
+        let h = Harness(snapshots: [ant()])
+        await h.io.setRevealANTOnPower(false)
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(outcome, .success)
+        let calls = await h.io.writes
+        XCTAssertEqual(calls, ["power:false", "power:true", "mode:FHD", "mode:UHD"])
+        let attempts = await h.store.attempts
+        XCTAssertEqual(attempts.max(), 1)
+    }
+    func testHardwareFHDWithSystem4KMustNotSkipUHD() async {
+        let h = Harness(snapshots: [ant(), msi()], hardware: .fhd)
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(outcome, .success)
+        let hardware = await h.io.hardware
+        let calls = await h.io.writes
+        XCTAssertEqual(hardware, .uhd)
+        XCTAssertEqual(calls, ["mode:UHD"])
+    }
+    func testMissingSystemModeCannotPass4KVerification() async throws {
+        let h = Harness(snapshots: [ant(), msi(nil)])
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertNotEqual(outcome, .success)
+        let tx = try await h.store.load()
+        XCTAssertTrue(tx?.modePending4K == true)
+        XCTAssertTrue(tx?.isStopped == true)
+    }
+    func testStaleObservationCannotStartRecovery() async {
+        let h = Harness()
+        await h.io.setObservationAge(20)
+        let result = await h.coordinator.triggerManualRecovery()
+        if case .skipped = result {} else { XCTFail("过期观测必须阻止介入") }
+        let calls = await h.io.writes
         XCTAssertTrue(calls.isEmpty)
     }
-
-    func testMissingNewDisplayRollsBackPowerAndFails() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint)],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144),
-            revealNewDisplayAfterPowerOff: false
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration())
-
-        await coordinator.triggerManualRecovery()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .failed)
-        XCTAssertTrue(status.lastError?.contains("新显示器") == true)
-        let calls = await io.calls
-        XCTAssertEqual(calls.filter { $0 == "plug:true" }.count, 1)
+    func testANTLossDuring4KStabilityIsFailure() async {
+        let h = Harness()
+        await h.io.setDropANTOnUHD(true)
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertNotEqual(outcome, .success)
+        let hardware = await h.io.hardware
+        XCTAssertEqual(hardware, .uhd)
     }
-
-    func testCannotReadOriginalModeFailsBeforePowerCycle() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint)],
-            mode: nil
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration())
-
-        await coordinator.triggerManualRecovery()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .failed)
-        XCTAssertTrue(status.lastError?.contains("HID") == true)
-        let calls = await io.calls
+    func testHealthyManualFHDRemainsUntouched() async {
+        let h = Harness(snapshots: [ant(), msi(fhd)], hardware: .fhd)
+        await h.poll(25)
+        let calls = await h.io.writes
         XCTAssertTrue(calls.isEmpty)
     }
-
-    func testSafeModeFailureRollsBackPower() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint)],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144),
-            failSafeMode: true
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration())
-
-        await coordinator.triggerManualRecovery()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .failed)
-        XCTAssertTrue(status.lastError?.contains("HID") == true)
-        let calls = await io.calls
-        XCTAssertEqual(calls, ["plug:false", "safe", "plug:true"])
-        let plugPower = await io.plugPower
-        XCTAssertTrue(plugPower)
+    func testManualANTPowerOffRemainsUntouched() async {
+        let h = Harness(snapshots: [msi(fhd)], hardware: .fhd, power: false)
+        await h.poll(25)
+        let calls = await h.io.writes
+        let tx = try? await h.store.load()
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertEqual(tx?.attemptCount ?? 0, 0)
     }
-
-    func testUnsupportedSafeModeTimesOutAndRollsBackPower() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint)],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144),
-            safeModeAvailable: false
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration())
-
-        await coordinator.triggerManualRecovery()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .failed)
-        XCTAssertTrue(status.lastError?.contains("1920×1080") == true)
-        let calls = await io.calls
-        XCTAssertEqual(calls, ["plug:false", "safe", "plug:true"])
+    func testUnknownPowerIsNotTreatedAsOn() async {
+        let h = Harness()
+        await h.io.setPowerReadFailure(true)
+        await h.poll(25)
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
     }
-
-    func testOldDisplayFailureLeavesPlugOnAndReportsFailure() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint)],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144),
-            revealOldDisplayAfterPowerOn: false
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration())
-
-        await coordinator.triggerManualRecovery()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .failed)
-        XCTAssertTrue(status.lastError?.contains("老显示器") == true)
-        let calls = await io.calls
-        XCTAssertEqual(calls.filter { $0 == "plug:true" }.count, 1)
-        let plugPower = await io.plugPower
-        XCTAssertTrue(plugPower)
+    func testSingleDisplayChangingSidesRestartsStabilityWindow() async {
+        let h = Harness(snapshots: [ant()])
+        await h.poll(8)
+        await h.io.replace([msi()])
+        _ = await h.coordinator.evaluateAndRecover()
+        var calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+        await h.poll(8, startup: false)
+        calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty, "换边后的 4 秒不能介入")
+        await h.poll(4, startup: false)
+        calls = await h.io.writes
+        XCTAssertTrue(calls.contains("mode:FHD"))
     }
-
-    func testRestoreFailureKeepsSafeModeAndPowerOn() async throws {
-        let io = FakeRecoveryIO(
-            snapshots: [DisplaySnapshot(displayID: 10, fingerprint: oldFingerprint)],
-            mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144),
-            failRestoreMode: true
-        )
-        let coordinator = RecoveryCoordinator(io: io, configuration: configuration())
-
-        await coordinator.triggerManualRecovery()
-        let status = await waitForTerminal(coordinator)
-
-        XCTAssertEqual(status.state, .failed)
-        XCTAssertTrue(status.lastError?.contains("模式") == true)
-        let finalMode = await io.mode
-        XCTAssertEqual(finalMode, DisplayModeSignature(width: 1920, height: 1080, refreshRate: 320))
-        let plugPower = await io.plugPower
-        XCTAssertTrue(plugPower)
+    func testAmbiguityFailsBeforeAnyCleanupWrite() async {
+        var duplicate = msi(fhd); duplicate.displayID = 21
+        let h = Harness(snapshots: [ant(), msi(fhd), duplicate], hardware: .fhd)
+        _ = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
     }
-
-    private func configuration(automatic: Bool = false) -> RecoveryConfiguration {
-        RecoveryConfiguration(
-            roles: DisplayRoleConfiguration(powerControlled: oldFingerprint, modeSwitch: newFingerprint),
-            recoveryCooldown: 0,
-            pollInterval: 0.01,
-            timeouts: RecoveryTimeouts(powerOff: 0.2, newDisplayOnline: 0.2, safeMode: 0.2, powerOn: 0.2, oldDisplayOnline: 0.2, restoreMode: 0.2),
-            automaticRecoveryEnabled: automatic
-        )
+    func testUnknownEnumerationDoesNotMeanANTAbsent() async {
+        let h = Harness(snapshots: [ant()])
+        await h.io.setEnumerationFailure(true)
+        _ = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
     }
-
-    private func waitForTerminal(_ coordinator: RecoveryCoordinator) async -> RecoveryStatus {
-        for _ in 0..<150 {
-            let status = await coordinator.status()
-            if !status.recoveryInProgress && (status.state == .completed || status.state == .failed) {
-                return status
-            }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        return await coordinator.status()
+    func testSleepingDisplayDoesNotTriggerPowerCycle() async {
+        var sleeping = ant(); sleeping.isAsleep = true
+        let h = Harness(snapshots: [sleeping])
+        await h.poll(25)
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testPendingPowerOnlyResumesWithoutRepeatingPowerOffOrFHD() async throws {
+        let tx = RecoveryTransaction(attemptCount: 1, powerPendingRestore: true, target: target)
+        let h = Harness(snapshots: [msi(fhd)], hardware: .fhd, power: false, transaction: tx, automatic: false)
+        let outcome = await h.coordinator.evaluateAndRecover()
+        XCTAssertEqual(outcome, .success)
+        let calls = await h.io.writes
+        XCTAssertEqual(calls, ["power:true", "mode:UHD"])
+        let saved = try await h.store.load()
+        XCTAssertFalse(saved?.hasPendingCleanup ?? true)
+    }
+    func testRestartWithPending4KOnlyPerformsUHD() async {
+        let tx = RecoveryTransaction(attemptCount: 1, modePending4K: true, target: target, msiHIDIdentity: "msi-usb-fixture")
+        let h = Harness(snapshots: [ant(), msi(fhd)], hardware: .fhd, transaction: tx)
+        let result = await h.coordinator.evaluateAndRecover()
+        XCTAssertEqual(result, .success)
+        let calls = await h.io.writes
+        XCTAssertEqual(calls, ["mode:UHD"])
+    }
+    func testUsedCleanupBudgetDoesNotRenewAcrossRestart() async throws {
+        let tx = RecoveryTransaction(attemptCount: 3, isStopped: true, modePending4K: true, target: target,
+            msiHIDIdentity: "msi-usb-fixture", modeCleanupUsed: true)
+        let h = Harness(snapshots: [ant(), msi(fhd)], hardware: .fhd, transaction: tx)
+        _ = await h.coordinator.evaluateAndRecover()
+        let restarted = h.newCoordinator()
+        _ = await restarted.evaluateAndRecover()
+        let calls = await h.io.writes
+        let saved = try await h.store.load()
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertTrue(saved?.modeCleanupUsed == true)
+        XCTAssertEqual(saved?.attemptCount, 3)
+    }
+    func testChangedTargetBlocksOldCleanup() async {
+        let oldTarget = RecoveryTarget(roles: configuration().roles, controlIdentity: "different-plug")
+        let tx = RecoveryTransaction(attemptCount: 1, powerPendingRestore: true, target: oldTarget)
+        let h = Harness(transaction: tx)
+        let result = await h.coordinator.triggerManualRecovery()
+        if case .stopped = result {} else { XCTFail("目标变化必须停止") }
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testLegacyPendingTransactionWithoutBindingIsNotGuessed() async {
+        let h = Harness(transaction: RecoveryTransaction(attemptCount: 1, powerPendingRestore: true))
+        _ = await h.coordinator.evaluateAndRecover()
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testJournalWriteFailurePreventsAllHardwareWrites() async {
+        let h = Harness()
+        await h.store.setFailAllSaves(true)
+        let result = await h.coordinator.triggerManualRecovery()
+        XCTAssertNotEqual(result, .success)
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testJournalReadFailureDoesNotCreateEmptyTransaction() async {
+        let h = Harness()
+        await h.store.setFailLoad(true)
+        _ = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        let saves = await h.store.savedStages
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertTrue(saves.isEmpty)
+    }
+    func testPersistenceFailureAfterFHDStillRunsIndependentUHDGuard() async throws {
+        let h = Harness()
+        await h.store.setFailStage(.waitingDualOnline)
+        let result = await h.coordinator.triggerManualRecovery()
+        XCTAssertNotEqual(result, .success)
+        let calls = await h.io.writes
+        XCTAssertEqual(calls, ["mode:FHD", "mode:UHD"])
+        let saved = try await h.store.load()
+        XCTAssertFalse(saved?.modePending4K ?? true)
+    }
+    func testThirdFailureStopsAndRestartKeepsCount() async throws {
+        let h = Harness(transaction: RecoveryTransaction(attemptCount: 2))
+        await h.io.setRevealANTOnFHD(false)
+        await h.poll(12)
+        var tx = try await h.store.load()
+        XCTAssertEqual(tx?.attemptCount, 3)
+        XCTAssertTrue(tx?.isStopped == true)
+        await h.io.clearWrites()
+        let restarted = h.newCoordinator()
+        h.clock.advance(20)
+        _ = await restarted.evaluateAndRecover()
+        tx = try await h.store.load()
+        let calls = await h.io.writes
+        XCTAssertEqual(tx?.attemptCount, 3)
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testOneHealthySnapshotDoesNotClearFailures() async throws {
+        let h = Harness(snapshots: [ant(), msi()], transaction: RecoveryTransaction(attemptCount: 2))
+        await h.poll(1)
+        let tx = try await h.store.load()
+        XCTAssertEqual(tx?.attemptCount, 2)
+    }
+    func testStableHealthy4KClearsStoppedLatch() async throws {
+        let h = Harness(snapshots: [ant(), msi()], transaction: RecoveryTransaction(attemptCount: 3, isStopped: true))
+        await h.poll(25)
+        let tx = try await h.store.load()
+        XCTAssertFalse(tx?.isStopped ?? true)
+        XCTAssertEqual(tx?.attemptCount, 0)
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testCallerCancellationBeforeWriteDoesNotStartRecovery() async {
+        let h = Harness()
+        let gate = TestGate(); await h.io.setGate(gate)
+        let task = Task { await h.coordinator.triggerManualRecovery() }
+        while !(await gate.entered) { await Task.yield() }
+        task.cancel(); await gate.release()
+        let outcome = await task.value
+        if case .cancelled = outcome {} else { XCTFail("必须报告取消") }
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testCancellationAfterFHDStillRestoresUHD() async throws {
+        let h = Harness()
+        await h.io.setCancelAfterFHD(true)
+        let outcome = await h.coordinator.triggerManualRecovery()
+        if case .cancelled = outcome {} else { XCTFail("必须报告取消") }
+        let calls = await h.io.writes
+        let tx = try await h.store.load()
+        XCTAssertEqual(calls, ["mode:FHD", "mode:UHD"])
+        XCTAssertFalse(tx?.hasPendingCleanup ?? true)
+    }
+    func testPowerCleanupFailureDoesNotSuppressUHD() async throws {
+        let h = Harness(snapshots: [ant()], hardware: .fhd)
+        await h.io.setFailPowerOn(true)
+        let outcome = await h.coordinator.triggerManualRecovery()
+        XCTAssertNotEqual(outcome, .success)
+        let calls = await h.io.writes
+        let tx = try await h.store.load()
+        XCTAssertTrue(calls.contains("mode:UHD"))
+        XCTAssertTrue(tx?.powerPendingRestore == true)
+        XCTAssertFalse(tx?.modePending4K ?? true)
+        XCTAssertFalse(tx?.cleanupErrors.isEmpty ?? true)
+    }
+    func testExpiredIOCannotSatisfyPrecondition() async {
+        let h = Harness()
+        await h.io.setPowerReadDelay(20)
+        _ = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testUnavailableHIDDoesNotConsumeAttemptOrChangeResolution() async throws {
+        let h = Harness()
+        await h.io.setHardwareUnavailable(true)
+        _ = await h.coordinator.triggerManualRecovery()
+        let calls = await h.io.writes
+        let tx = try await h.store.load()
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertEqual(tx?.attemptCount ?? 0, 0)
+    }
+    func testAutomaticRecoveryHonorsSharedTransactionLock() async {
+        let h = Harness()
+        XCTAssertTrue(h.transactionLock.tryLock())
+        let automatic = await h.coordinator.evaluateAndRecover()
+        let manual = await h.coordinator.triggerManualRecovery()
+        XCTAssertEqual(automatic, .busy)
+        XCTAssertEqual(manual, .busy)
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+        h.transactionLock.unlock()
+    }
+    func testTwoCoordinatorsCannotOverlapAndBusyCannotClearStop() async {
+        let h = Harness(transaction: RecoveryTransaction(attemptCount: 2))
+        let gate = TestGate(); await h.io.setGate(gate)
+        let running = Task { await h.coordinator.triggerManualRecovery() }
+        while !(await gate.entered) { await Task.yield() }
+        let other = h.newCoordinator()
+        let outcome = await other.triggerManualRecovery()
+        let cleared = await h.coordinator.clearStop()
+        let retired = await h.coordinator.retireForConfigurationChange()
+        XCTAssertEqual(outcome, .busy)
+        XCTAssertFalse(cleared)
+        XCTAssertFalse(retired)
+        await gate.release()
+        _ = await running.value
+    }
+    func testDryRunDoesNotWriteHardwareOrResetAttemptCount() async throws {
+        let h = Harness(transaction: RecoveryTransaction(attemptCount: 2))
+        _ = await h.coordinator.previewRecovery()
+        let calls = await h.io.writes
+        let stages = await h.store.savedStages
+        let tx = try await h.store.load()
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertTrue(stages.isEmpty)
+        XCTAssertEqual(tx?.attemptCount, 2)
+    }
+    func testWallClockChangesDoNotAdvanceSingleDisplayTimer() async {
+        let h = Harness()
+        await h.poll(2)
+        h.clock.jumpWallClock(86400)
+        _ = await h.coordinator.evaluateAndRecover()
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
+    }
+    func testWakeStartsNewGracePeriod() async {
+        let h = Harness()
+        await h.poll(6)
+        await h.coordinator.notifySystemWokeUp()
+        await h.poll(16, startup: false)
+        let calls = await h.io.writes
+        XCTAssertTrue(calls.isEmpty)
     }
 }
 
-private actor FakeRecoveryIO: RecoveryIO {
-    private(set) var snapshots: [DisplaySnapshot]
-    private(set) var plugPower = true
-    private(set) var mode: DisplayModeSignature?
-    private(set) var calls: [String] = []
-    private let revealNewDisplayAfterPowerOff: Bool
-    private let revealOldDisplayAfterPowerOn: Bool
-    private let failSafeMode: Bool
-    private let failRestoreMode: Bool
-    private let safeModeAvailable: Bool
-
-    init(
-        snapshots: [DisplaySnapshot],
-        mode: DisplayModeSignature?,
-        revealNewDisplayAfterPowerOff: Bool = true,
-        revealOldDisplayAfterPowerOn: Bool = true,
-        failSafeMode: Bool = false,
-        failRestoreMode: Bool = false,
-        safeModeAvailable: Bool = true
-    ) {
-        self.snapshots = snapshots
-        self.mode = mode
-        self.revealNewDisplayAfterPowerOff = revealNewDisplayAfterPowerOff
-        self.revealOldDisplayAfterPowerOn = revealOldDisplayAfterPowerOn
-        self.failSafeMode = failSafeMode
-        self.failRestoreMode = failRestoreMode
-        self.safeModeAvailable = safeModeAvailable
+private final class TestClock: RecoveryClock, @unchecked Sendable {
+    private let lock = NSLock()
+    private var uptime: TimeInterval = 0
+    private var wall: TimeInterval = 1_000_000
+    var now: Date { lock.withLock { Date(timeIntervalSince1970: wall) } }
+    var monotonicNow: TimeInterval { lock.withLock { uptime } }
+    func advance(_ seconds: TimeInterval) { lock.withLock { uptime += seconds; wall += seconds } }
+    func jumpWallClock(_ seconds: TimeInterval) { lock.withLock { wall += seconds } }
+    func sleep(seconds: TimeInterval) async throws { try Task.checkCancellation(); advance(seconds); await Task.yield() }
+}
+private actor TestGate {
+    var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async {
+        guard !entered else { return }
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
     }
-
-    func displaySnapshots() async -> [DisplaySnapshot] { snapshots }
-
-    func setPlugPower(_ on: Bool) async throws {
-        plugPower = on
-        calls.append("plug:\(on)")
-        if on, revealOldDisplayAfterPowerOn {
-            let old = DisplaySnapshot(displayID: 10, fingerprint: DisplayFingerprint(vendor: "ANT", model: "ANT27VU", serial: "old"), mode: DisplayModeSignature(width: 3840, height: 2160, refreshRate: 60))
-            if !snapshots.contains(where: { $0.fingerprint.model == old.fingerprint.model }) {
-                snapshots.append(old)
-            }
-        } else if revealNewDisplayAfterPowerOff {
-            let new = DisplaySnapshot(displayID: 20, fingerprint: DisplayFingerprint(vendor: "MSI", model: "MPG 274U E16M", serial: "new"), mode: mode)
-            snapshots.removeAll { $0.fingerprint.model == "ANT27VU" }
-            if !snapshots.contains(where: { $0.fingerprint.model == new.fingerprint.model }) {
-                snapshots.append(new)
-            }
-        }
+    func release() { continuation?.resume(); continuation = nil }
+}
+private actor TestStore: RecoveryTransactionStoreProtocol {
+    private var loadGate: TestGate?
+    private(set) var loadCount = 0
+    func setLoadGate(_ gate: TestGate) { loadGate = gate }
+    private var transaction: RecoveryTransaction?
+    private var failLoad = false
+    private var failAllSaves = false
+    private var failStage: RecoveryStage?
+    private(set) var savedStages: [RecoveryStage] = []
+    private(set) var attempts: [Int] = []
+    init(_ transaction: RecoveryTransaction?) { self.transaction = transaction }
+    func setFailLoad(_ value: Bool) { failLoad = value }
+    func setFailAllSaves(_ value: Bool) { failAllSaves = value }
+    func setFailStage(_ stage: RecoveryStage) { failStage = stage }
+    func load() async throws -> RecoveryTransaction? {
+        loadCount += 1
+        if let loadGate { await loadGate.wait() }
+        if failLoad { throw RecoveryError.operationFailed("模拟事务文件损坏") }
+        return transaction
     }
-
-    func readPlugPower() async throws -> Bool { plugPower }
-
-    func readModeSwitchMode() async throws -> DisplayModeSignature? { mode }
-
-    func setModeSwitchSafeMode() async throws {
-        calls.append("safe")
-        if failSafeMode {
-            throw RecoveryError.monitorUnavailable
-        }
-        guard safeModeAvailable else { return }
-        mode = DisplayModeSignature(width: 1920, height: 1080, refreshRate: 320)
+    func save(_ transaction: RecoveryTransaction) async throws {
+        if failAllSaves || transaction.stage == failStage { throw RecoveryError.operationFailed("模拟落盘失败") }
+        self.transaction = transaction
+        savedStages.append(transaction.stage); attempts.append(transaction.attemptCount)
+    }
+    func clear() async throws { transaction = nil }
+}
+private actor TestIO: RecoveryIO {
+    nonisolated let targetIdentity = "plug-fixture"
+    let clock: TestClock
+    private var snapshots: [DisplaySnapshot]
+    private(set) var hardware: MsiHardwareDualMode
+    private var power: Bool
+    private(set) var writes: [String] = []
+    private var revealANTOnPower = true
+    private var revealANTOnFHD = true
+    private var revealANTOnUHD = false
+    private var dropANTOnUHD = false
+    private var failPowerOn = false
+    private var powerReadFailure = false
+    private var enumerationFailure = false
+    private var hardwareUnavailable = false
+    private var cancelAfterFHD = false
+    private var observationAge: TimeInterval = 0
+    private var powerReadDelay: TimeInterval = 0
+    private var gate: TestGate?
+    init(clock: TestClock, snapshots: [DisplaySnapshot], hardware: MsiHardwareDualMode, power: Bool) {
+        self.clock = clock; self.snapshots = snapshots; self.hardware = hardware; self.power = power
+    }
+    func clearWrites() { writes = [] }
+    func replace(_ snapshots: [DisplaySnapshot]) { self.snapshots = snapshots }
+    func setRevealANTOnPower(_ value: Bool) { revealANTOnPower = value }
+    func setRevealANTOnFHD(_ value: Bool) { revealANTOnFHD = value }
+    func setRevealANTOnUHD(_ value: Bool) { revealANTOnUHD = value }
+    func setDropANTOnUHD(_ value: Bool) { dropANTOnUHD = value }
+    func setFailPowerOn(_ value: Bool) { failPowerOn = value }
+    func setPowerReadFailure(_ value: Bool) { powerReadFailure = value }
+    func setEnumerationFailure(_ value: Bool) { enumerationFailure = value }
+    func setHardwareUnavailable(_ value: Bool) { hardwareUnavailable = value }
+    func setCancelAfterFHD(_ value: Bool) { cancelAfterFHD = value }
+    func setObservationAge(_ value: TimeInterval) { observationAge = value }
+    func setPowerReadDelay(_ value: TimeInterval) { powerReadDelay = value }
+    func setGate(_ gate: TestGate) { self.gate = gate }
+    func observeDisplays(deadline: RecoveryDeadline) async throws -> DisplayObservation {
+        if enumerationFailure { throw RecoveryError.operationFailed("模拟枚举不可用") }
+        return DisplayObservation(snapshots: snapshots, observedAt: clock.monotonicNow - observationAge)
+    }
+    func readPlugPower(deadline: RecoveryDeadline) async throws -> Bool {
+        if let gate { await gate.wait() }
+        if powerReadFailure { throw RecoveryError.plugUnavailable("模拟网络不可用") }
+        clock.advance(powerReadDelay)
+        return power
+    }
+    func setPlugPower(_ on: Bool, deadline: RecoveryDeadline) async throws {
+        try deadline.check()
+        writes.append("power:\(on)")
+        if on && failPowerOn { throw RecoveryError.plugUnavailable("模拟供电恢复失败") }
+        power = on
+        if !on {
+            snapshots = [msi(hardware == .fhd ? fhd : uhd)]
+        } else if revealANTOnPower && !snapshots.contains(where: { $0.displayID == 10 }) { snapshots.append(ant()) }
+    }
+    func readHardwareMode(deadline: RecoveryDeadline) async throws -> HardwareModeObservation {
+        if hardwareUnavailable { throw RecoveryError.monitorUnavailable }
+        return HardwareModeObservation(mode: hardware, identity: "msi-usb-fixture", observedAt: clock.monotonicNow)
+    }
+    func setHardwareMode(_ mode: MsiHardwareDualMode, expectedIdentity: String, deadline: RecoveryDeadline) async throws {
+        try deadline.check()
+        guard expectedIdentity == "msi-usb-fixture" else { throw RecoveryError.monitorUnavailable }
+        writes.append("mode:\(mode.rawValue)")
+        hardware = mode
         snapshots = snapshots.map { snapshot in
-            var copy = snapshot
-            if snapshot.fingerprint.model == "MPG 274U E16M" { copy.mode = mode }
-            return copy
+            var result = snapshot
+            if result.displayID == 20 { result.mode = mode == .uhd ? uhd : fhd }
+            return result
         }
+        if mode == .fhd && revealANTOnFHD && !snapshots.contains(where: { $0.displayID == 10 }) { snapshots.append(ant()) }
+        if mode == .uhd && revealANTOnUHD && !snapshots.contains(where: { $0.displayID == 10 }) { snapshots.append(ant()) }
+        if mode == .uhd && dropANTOnUHD { snapshots.removeAll { $0.displayID == 10 } }
+        if mode == .fhd && cancelAfterFHD { deadline.cancellation.cancel("模拟切到 FHD 后取消") }
     }
-
-    func restoreModeSwitchMode(_ target: DisplayModeSignature) async throws {
-        calls.append("restore:\(target.width)x\(target.height)@\(target.refreshRate.rounded())")
-        if failRestoreMode {
-            throw RecoveryError.modeNotAvailable(target)
-        }
-        mode = target
-        snapshots = snapshots.map { snapshot in
-            var copy = snapshot
-            if snapshot.fingerprint.model == "MPG 274U E16M" { copy.mode = target }
-            return copy
+}
+private struct Harness: Sendable {
+    let clock: TestClock
+    let io: TestIO
+    let store: TestStore
+    let transactionLock: InMemoryRecoveryTransactionLock
+    let coordinator: RecoveryCoordinator
+    let config: RecoveryConfiguration
+    init(snapshots: [DisplaySnapshot] = [msi()], hardware: MsiHardwareDualMode = .uhd, power: Bool = true,
+         transaction: RecoveryTransaction? = nil, automatic: Bool = true) {
+        clock = TestClock(); io = TestIO(clock: clock, snapshots: snapshots, hardware: hardware, power: power)
+        store = TestStore(transaction); transactionLock = InMemoryRecoveryTransactionLock(); config = configuration(automatic: automatic)
+        coordinator = RecoveryCoordinator(io: io, configuration: config, clock: clock, transactionStore: store, transactionLock: transactionLock)
+    }
+    func newCoordinator() -> RecoveryCoordinator {
+        RecoveryCoordinator(io: io, configuration: config, clock: clock, transactionStore: store, transactionLock: transactionLock)
+    }
+    func poll(_ count: Int, startup: Bool = true) async {
+        if startup { clock.advance(11) }
+        for _ in 0..<count {
+            _ = await coordinator.evaluateAndRecover()
+            clock.advance(0.5)
         }
     }
 }

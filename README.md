@@ -1,98 +1,83 @@
 # 双显示器自动恢复
 
-这是一个原生 macOS 菜单栏程序，针对 macOS 在多显示器启动或热插拔时出现的显示器枚举异常，按可观测状态执行一次恢复。
+原生 macOS 菜单栏 App 与 CLI，针对 ANT ANT27VU 和 MSI MPG 274U E16M 的显示枚举异常，通过已验证的插座断电与 MSI 双模式切换流程恢复双屏。要求 macOS 13 或更高版本。
 
-## macOS 问题背景
+## 恢复规则
 
-在部分 Mac、扩展坞/转接器和双显示器组合中，macOS 启动或唤醒后的显示器发现顺序并不稳定。常见表现是：
+所有已接管的恢复最终都要回到 MSI 4K。过程中允许临时进入 1080P；成功必须同时满足：两台目标显示器在线且身份明确、MSI HID 读回 UHD、系统显示 MSI 为 4K，并连续稳定 10 秒。旧缓存、缺失模式或 HID 与系统读数矛盾均不能算成功。
 
-- 两台显示器物理上都已通电，但 macOS 只枚举先完成握手的老显示器；
-- 第二台显示器没有出现在系统显示器列表中，或只短暂出现后消失；
-- 拔插视频线、重启显示器，甚至打开“系统设置 → 显示器”也无法稳定恢复；
-- 只有切断已被 macOS 识别的显示器电源，迫使显示链路重新建立，另一台显示器才会出现；
-- 第二台显示器恢复后，如果它仍处于 4K 高刷新率模式，macOS 可能再次无法完成双屏握手。
+无未完成恢复责任时，自动恢复保留这两种手动选择：
 
-这不是应用层可以通过重新排列窗口或调用一次显示器刷新 API 彻底解决的问题。根因通常位于 macOS 的显示器枚举、EDID 读取、DisplayPort/HDMI 链路训练或转接设备状态之间的时序竞争；具体触发点会随 Mac 型号、系统版本、线材、扩展坞和显示器固件而变化。因此本项目将它视为“可观测的系统级恢复场景”，不宣称存在适用于所有设备的单一 Apple 修复方案。
+- 双屏正常在线，用户手动使用 MSI 1080P。
+- ANT 插座关闭，用户单独使用 MSI 1080P。
 
-本项目的目标不是修改 macOS，而是把人工执行的安全恢复动作自动化：暂时让先上线的显示器离线，让 macOS 重新发现另一台显示器；待两台都完成枚举后，再恢复原来的显示模式。
+插座通信失败表示状态未知，不能当作插座关闭或开启。程序自己关闭的供电、自己留下的临时模式，会通过事务记录与手动选择区分。
 
-## 处理机制
+## 恢复流程
 
-恢复流程严格按状态机执行，只有确认显示器身份后才允许切换电源：
+- **只有 ANT 在线：** 同一单屏拓扑稳定 5 秒后，先登记恢复责任，关闭 ANT 插座并确认 ANT 离线；等待 MSI 枚举，重新开启 ANT 插座；给 ANT 最多 10 秒自然上线。自然恢复双屏后直接进入 4K 收尾；仍确认只有 MSI 在线才使用临时 1080P。
+- **只有 MSI 在线：** 确认 ANT 插座开启、MSI HID 就绪、目标身份未变化，临时切换 FHD，等待双屏，然后切回 UHD 并验证系统 4K。即使 FHD 阶段等待双屏超时，也要继续进入统一 4K 收尾并完整核验；有些重新枚举会在回切 UHD 后才完成。最终仍缺屏时报告失败。
+- **失败、取消、正常退出：** 独立尝试恢复供电和 MSI 4K，每项收尾最多一次写入、各 5 秒总预算。收尾失败会保留责任和具体错误，不会退回 FHD 并宣布完成。
+- **重启：** 优先接续未完成收尾，不重发关电或 FHD 起始动作，不重置收尾额度。旧记录缺少目标绑定时阻止自动控制，保留记录供核对。
 
-1. 通过 CoreGraphics 获取当前显示器快照，并用 EDID 派生的厂商、型号、序列号和 EDID 哈希识别两台显示器；不依赖会变化的 `displayID`。
-2. 仅在“插座控制的老显示器恰好在线、模式切换显示器明确不在线”时触发，存在多个候选时直接停止，避免误断电。
-3. 读取并缓存模式显示器最后一次真实模式（例如 4K144），防止目标暂时离线后把原模式错误当成固定的 4K60。
-4. 通过局域网 MIoT/miIO 控制智能插座关闭老显示器，并轮询确认插座已关闭、老显示器已离线。
-5. 等待模式显示器重新被 macOS 枚举，然后通过 MSI USB HID 将寄存器 `002E0` 切换到 1080P 安全模式（`001`）。低分辨率模式降低链路训练和双屏重新握手的压力。
-6. 打开老显示器电源，等待 macOS 同时枚举两台显示器，并确认它们是两个不同的显示设备。
-7. 通过 USB HID 将模式显示器恢复到流程开始前记录的模式（4K 时写回 `000`），再次读取并确认模式已生效。
+同一故障最多尝试三次，冷却从每次结束开始计算 30 秒。未完成收尾也会停止新的恢复动作，后续仅按冷却间隔核查和接续尚未使用的收尾额度。重启、保存配置和短暂双屏上线都不清零。双屏和 MSI 4K 持续健康 10 秒，或用户明确重新授权，才能解除停止。
 
-每个阶段都有超时、轮询和失败状态。流程中途失败时，如果插座曾被关闭，程序会尽力重新打开插座；不会在无法确认显示器身份或原始模式时贸然断电。自动恢复还带有冷却时间，避免显示器事件频繁触发连续切换。
+启动、系统唤醒和非恢复期间的模式变化有 10 秒观察期。同一单屏观察窗口会在拓扑换边、歧义、休眠或观测中断时重新开始。时间判断使用单调时钟，系统时间修改不影响运行中的期限。
 
-这里的“恢复”是对当前硬件组合的经验性规避方案，不保证修复 macOS 的底层枚举缺陷，也不保证适用于所有 Mac、扩展坞、转接器或显示器。执行前必须确认插座确实只控制目标老显示器，并先使用手动恢复完成真实硬件验收。
+## 目标、互斥与持久化
 
-1. 识别已配置的老显示器和 MSI 模式显示器；
-2. 通过小米智能插座关闭老显示器，并等待它离线；
-3. 等待 MSI 显示器出现，通过 USB HID 将 `002E0` 写为 `001`（1080P320）；
-4. 打开插座，等待老显示器重新枚举且两台都在线；
-5. 将 `002E0` 写回 `000`（4K），并确认模式已恢复。
+通过配置的完整指纹识别显示器，排除内置屏。MSI 别名只能使用明确登记的完整指纹；不会用“同厂商”绕过序列号，不会将任意非 MSI 显示器认作 ANT。
 
-所有等待都由 CoreGraphics 显示器事件和轮询状态驱动，带超时、重试、冷却时间和失败回滚。角色使用 EDID 派生的厂商、型号、序列号和 EDID 哈希匹配，不依赖易变化的显示器编号；身份无法确定时不会自动断电。程序会在模式屏在线时缓存实际刷新率，因此目标暂时离线时不会把 4K144 误认为固定的其他刷新率。
+App 自动恢复、手动恢复、重启收尾、CLI 恢复和插座写命令共用进程锁：
 
-## 支持范围
-
-- macOS 13 或更高版本，非沙盒应用；
-- MSI USB HID：VID `0x1462`、PID `0x3FA4`，模式寄存器 `002E0`；
-- 小米局域网插座：`chuangmi.plug.212a01`（截图中的二代）和 `cuco.plug.v3`（三代兼容接口）；
-- 插座使用 MIoT/miIO UDP 协议，端口默认为 `54321`。Token 只写入 macOS Keychain。
-
-## 构建
-
-```sh
-cd /Volumes/resourse/CurCode/display-recovery-automation
-swift build
-DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun swift test
-./scripts/build.sh
+```text
+~/Library/Application Support/DisplayRecoveryAutomation/recovery.lock
 ```
 
-`scripts/build.sh` 会生成 `dist/DisplayRecoveryAutomation.app` 和 `dist/display-recovery-cli`，并使用 ad-hoc 签名方便本机运行。当前命令行工具链没有 XCTest 模块时，请使用已安装的 Xcode `DEVELOPER_DIR` 路径运行测试。
+HID 查询也会发送 USB 报告，因此需要取得同一锁；锁忙时 CLI 只展示持久化状态。锁覆盖整个恢复与异常收尾，忙状态不会消耗恢复次数。
 
-## 使用
+同目录中的文件：
 
-1. 启动 `dist/DisplayRecoveryAutomation.app`，从菜单栏打开控制面板；
-2. 填写插座 IP 和型号，输入 token 后保存。程序会先调用 `miIO.info` 验证实际型号；
-3. 在在线显示器列表中分别设置“插座屏”和“模式屏”；
-4. 先保持自动恢复关闭，使用“立即恢复双屏”完成一次真实硬件验收；确认流程稳定后再开启自动恢复。
+| 文件 | 用途 |
+| --- | --- |
+| `config.json` | 版本化角色、插座和恢复配置，不含 Token |
+| `secrets.json` | 本地 Token，原子写入且权限为 0600 |
+| `recovery-transaction.json` | 第 2 版事务，保存阶段、目标绑定、失败次数、停止状态和收尾额度 |
 
-如果同一厂商连接了多台显示器，角色匹配会检测到多个候选并停止自动操作；此时在控制面板重新选择带有完整 EDID 信息的显示器角色。
+关键事务必须落盘成功才能操作硬件；读取损坏记录会报错，不会当作空记录重新计数。完成记录提交成功后才清零。事务绑定固定角色和控制配置的不可逆指纹，不能借后来更换的目标或凭据处理旧责任。
 
-CLI 只读诊断和控制命令：
+普通凭据读取不访问 Keychain。只有用户点击“从 Keychain 导入”才会读取历史凭据，导入后保留 Keychain 原件。设置保存失败时保留草稿；恢复进行中或存在未完成责任时不能替换目标和凭据。关闭自动恢复会取消当前恢复并执行有限收尾。
+
+## 构建与使用
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun swift test -Xswiftc -strict-concurrency=complete
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer ./scripts/build.sh
+```
+
+产物是 `dist/DisplayRecoveryAutomation.app` 和 `dist/display-recovery-cli`。项目仍使用 Swift 5 语言兼容模式，通过完整并发检查验证；miIO 协议规定使用 MD5/AES，相关兼容实现保留协议算法。
 
 ```sh
 dist/display-recovery-cli displays
+dist/display-recovery-cli status
+dist/display-recovery-cli diagnose
 dist/display-recovery-cli hid-status
 dist/display-recovery-cli plug-info
+dist/display-recovery-cli recover --dry-run
 dist/display-recovery-cli recover
+dist/display-recovery-cli plug-on
+dist/display-recovery-cli plug-off
 dist/display-recovery-cli export-log
 ```
 
-`plug-on` 和 `plug-off` 会真实切换插座，只有在确认 IP、型号和 token 正确后才应执行。`recover` 也会执行真实恢复流程，首次使用建议从菜单栏控制面板开始并保持自动恢复关闭。
+`recover --dry-run` 与恢复入口共用预检查，只读取状态，不写硬件、事务或恢复次数。真实 `recover` 会等待终态；失败、停止和忙返回非零，取消返回 130。CLI 接收 SIGINT/SIGTERM 后执行有限收尾再退出。SIGKILL 或断电无法执行即时收尾，由下次启动读取持久化责任。
 
-## 日志和安全
+日志位于 `~/Library/Logs/DisplayRecoveryAutomation/recovery.log`。记录事务、阶段、尝试次数与收尾责任，写入前脱敏 IP 和 Token，合并重复消息，超过 2 MB 轮转；导出包含当前和上一份日志。
 
-恢复日志写入 `~/Library/Logs/DisplayRecoveryAutomation/recovery.log`。日志不记录 token；导出功能会把 IPv4 地址替换为 `<IP>`。插座命令失败、MSI HID 暂时消失、模式不存在、显示器未重新枚举等情况都会进入 `Failed` 状态，保留安全模式并尝试把插座恢复为开启。
+## 验证范围
 
-MIoT 协议本身要求使用 MD5 派生 AES-128-CBC 密钥和校验和；这里仅为兼容设备协议，不把 MD5 用作新的安全哈希。
+本次修复的测试结果、实机经过及未覆盖情形见 [2026-09-08 验收记录](docs/verification-20260908.md)。
 
-## 目录
+自动化测试覆盖恢复正向流程、两种手动 1080P 例外、观测过期和身份歧义、落盘失败、重启接续、三次停止、独立收尾、进程互斥及取消。插座测试使用仅绑定 127.0.0.1 的模拟器，包含已执行命令但应答丢失、静默设备与取消，不控制真实插座。
 
-- `Sources/DisplayRecoveryCore`：模型和恢复状态机；
-- `Sources/MsiHid`：MSI HID 读写；
-- `Sources/MiotLocal`：二代、三代插座的局域网客户端；
-- `Sources/DisplayRecoveryMac`：CoreGraphics、IOKit、Keychain、配置和日志；
-- `Sources/DisplayRecoveryApp`：AppKit 菜单栏界面；
-- `Sources/DisplayRecoveryCLI`：诊断及手动恢复命令；
-- `Tests`：状态机异常路径、协议输入校验、本地 MIoT UDP 模拟设备、配置和脱敏日志测试。
-
-现有的 `mpg-dual-mode-switcher` 项目不会被本项目修改。
+诊断和 dry-run 只证明预检查可运行。真实恢复验收必须另行记录：初始拓扑、实际执行的电源/模式动作、最终 HID UHD 和系统 4K、双屏持续稳定的证据。软件不能保证修复 macOS 驱动、线缆或显示器本身的故障；不能确认 4K 时会保留未完成责任。
