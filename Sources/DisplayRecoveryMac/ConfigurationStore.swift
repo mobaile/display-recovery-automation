@@ -21,7 +21,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
-        guard self.version == 1 else { throw ConfigurationStoreError.corruptedConfiguration("不支持的配置版本") }
+        guard self.version == 1 else { throw ConfigurationStoreError.corruptedConfiguration("Unsupported configuration version.") }
         self.recovery = try container.decodeIfPresent(RecoveryConfiguration.self, forKey: .recovery) ?? RecoveryConfiguration()
         self.plug = try container.decodeIfPresent(PlugConfiguration.self, forKey: .plug) ?? PlugConfiguration()
     }
@@ -35,11 +35,11 @@ public enum ConfigurationStoreError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .corruptedConfiguration(let reason):
-            return "配置文件已损坏：\(reason)"
+            return "Configuration file corrupted: \(reason)"
         case .migrationFailed(let reason):
-            return "迁移失败：\(reason)"
+            return "Migration failed: \(reason)"
         case .tokenInvalid(let reason):
-            return "Token 无效：\(reason)"
+            return "Invalid token: \(reason)"
         }
     }
 }
@@ -82,7 +82,6 @@ public final class ConfigurationStore: @unchecked Sendable {
             let cfg = try load()
             return (cfg, nil)
         } catch {
-            // 备份损坏配置，保留默认以保证界面能起，但明确上报错误
             let backupUrl = url.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970)).bak")
             try? FileManager.default.copyItem(at: url, to: backupUrl)
             return (AppConfiguration(), error)
@@ -94,6 +93,12 @@ public final class ConfigurationStore: @unchecked Sendable {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let data = try encoder.encode(configuration)
         try AtomicPrivateFile.write(data, to: url)
+    }
+
+    public func saveManualConfiguration(_ configuration: AppConfiguration) throws {
+        var manualConfig = configuration
+        manualConfig.recovery.automaticRecoveryEnabled = false
+        try save(manualConfig)
     }
 }
 
@@ -149,7 +154,7 @@ public final class SecretsStore: @unchecked Sendable {
     private func saveTokenLocked(_ token: String) throws {
         let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard cleanToken.count == 32, cleanToken.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else {
-            throw ConfigurationStoreError.tokenInvalid("需要 32 位十六进制 Token")
+            throw ConfigurationStoreError.tokenInvalid("Requires a 32-character hexadecimal token.")
         }
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -166,7 +171,6 @@ public final class SecretsStore: @unchecked Sendable {
         }
     }
 
-    /// 独立的 Keychain 迁移方法：显式执行，成功落盘并校验后才清理 Keychain
     @discardableResult
     public func migrateFromKeychainExplicitly() throws -> String? {
         lock.lock()
@@ -178,19 +182,17 @@ public final class SecretsStore: @unchecked Sendable {
         }
         let cleanToken = legacyToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard cleanToken.count == 32, cleanToken.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else {
-            throw ConfigurationStoreError.tokenInvalid("Keychain 中的 Token 格式无效（非 32 位十六进制）")
+            throw ConfigurationStoreError.tokenInvalid("Token in Keychain is invalid (not a 32-character hex string).")
         }
 
         try saveTokenLocked(cleanToken)
 
-        // 读回验证落盘
         guard let verifiedData = try? Data(contentsOf: url),
               let verified = try? decoder.decode(AppSecrets.self, from: verifiedData),
               verified.miotToken == cleanToken else {
-            throw ConfigurationStoreError.migrationFailed("写入本地 secrets.json 读回校验失败，已中止删除 Keychain")
+            throw ConfigurationStoreError.migrationFailed("Failed to verify saved secrets.json after Keychain migration.")
         }
 
-        // 导入不等于授权删除原凭据；保留 Keychain 中的原件。
         return cleanToken
     }
 }
@@ -202,9 +204,9 @@ public enum KeychainStoreError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .unexpectedStatus(let status):
-            return "Keychain 操作失败（\(status)）"
+            return "Keychain operation failed (\(status))."
         case .invalidData:
-            return "Keychain 数据格式无效"
+            return "Invalid Keychain data."
         }
     }
 }

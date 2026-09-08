@@ -52,13 +52,13 @@ public final class MacDisplayProvider: @unchecked Sendable {
     @MainActor public func checkedSnapshots() throws -> [DisplaySnapshot] {
         var count: UInt32 = 0
         guard CGGetOnlineDisplayList(0, nil, &count) == .success else {
-            throw RecoveryError.operationFailed("CoreGraphics 无法读取显示器数量")
+            throw RecoveryError.operationFailed("CoreGraphics cannot read display count.")
         }
         if count == 0 { return [] }
 
         var displayIDs = Array(repeating: CGDirectDisplayID(0), count: Int(count))
         guard CGGetOnlineDisplayList(count, &displayIDs, &count) == .success else {
-            throw RecoveryError.operationFailed("CoreGraphics 显示器枚举失败")
+            throw RecoveryError.operationFailed("CoreGraphics display enumeration failed.")
         }
 
         return displayIDs.prefix(Int(count)).map(makeSnapshot(displayID:))

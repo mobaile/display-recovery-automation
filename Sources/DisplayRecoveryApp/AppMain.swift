@@ -16,20 +16,20 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
     private let model = AppModel()
     private var statusItem: NSStatusItem!
     private var menu = NSMenu()
-    private var panelController: RecoveryPanelController?
+    private var mainWindowController: ScreenPilotWindowController?
+    private var settingsWindowController: SettingsWindowController?
     private var observation: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "双屏"
-        statusItem.button?.toolTip = "双显示器自动恢复"
+        statusItem.button?.title = "ScreenPilot"
+        statusItem.button?.toolTip = "ScreenPilot Display Control"
         rebuildMenu()
 
         observation = model.objectWillChange.sink { [weak self] _ in
             Task { @MainActor in
-                self?.rebuildMenu()
-                self?.panelController?.refresh()
+                self?.mainWindowController?.refresh()
             }
         }
     }
@@ -46,397 +46,398 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
-    @objc private func openPanel() {
-        if panelController == nil {
-            panelController = RecoveryPanelController(model: model)
+    @objc private func openMainWindow() {
+        if mainWindowController == nil {
+            mainWindowController = ScreenPilotWindowController(model: model, onClose: { [weak self] in
+                self?.checkActivationPolicy()
+            })
         }
-        panelController?.showWindow(nil)
+        NSApp.setActivationPolicy(.regular)
+        mainWindowController?.showWindow(nil)
+        mainWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func toggleAutomaticRecovery(_ sender: NSMenuItem) {
-        model.automaticRecoveryEnabled = sender.state != .on
-        rebuildMenu()
+    @objc private func openSettingsWindow() {
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController(model: model, onClose: { [weak self] in
+                self?.checkActivationPolicy()
+            })
+        }
+        NSApp.setActivationPolicy(.regular)
+        settingsWindowController?.showWindow(nil)
+        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func triggerRecovery() {
-        model.triggerRecovery()
-    }
-
-    @objc private func clearStop() {
-        model.clearStop()
-    }
-    @objc private func cancelRecovery() { model.cancelRecovery() }
-
-    @objc private func refresh() {
-        Task { @MainActor in await model.refresh() }
+    private func checkActivationPolicy() {
+        let mainVisible = mainWindowController?.window?.isVisible == true
+        let settingsVisible = settingsWindowController?.window?.isVisible == true
+        if !mainVisible && !settingsVisible {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
 
-        let title = NSMenuItem(title: "双显示器自动恢复", action: nil, keyEquivalent: "")
-        title.isEnabled = false
-        menu.addItem(title)
+        let openItem = NSMenuItem(title: "Open ScreenPilot…", action: #selector(openMainWindow), keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsWindow), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         menu.addItem(.separator())
 
-        let stageStr = model.recoveryStatus.stage.rawValue
-        let attemptStr = model.recoveryStatus.attemptCount > 0 ? " (尝试 \(model.recoveryStatus.attemptCount)/3)" : ""
-        let statusTitle = "[\(stageStr)] \(model.recoveryStatus.message)\(attemptStr)"
-        let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
+        let quitItem = NSMenuItem(title: "Quit ScreenPilot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quitItem)
 
-        if model.recoveryStatus.modePending4K {
-            let pending4K = NSMenuItem(title: "责任：待恢复到 4K", action: nil, keyEquivalent: "")
-            pending4K.isEnabled = false
-            menu.addItem(pending4K)
-        }
-
-        if model.recoveryStatus.isStopped {
-            let stopped = NSMenuItem(title: "已停止：\(model.recoveryStatus.stopReason ?? "等待手动恢复")", action: nil, keyEquivalent: "")
-            stopped.isEnabled = false
-            menu.addItem(stopped)
-        }
-
-        if let error = model.recoveryStatus.lastError ?? model.lastError {
-            let errorItem = NSMenuItem(title: "最近异常：\(error)", action: nil, keyEquivalent: "")
-            errorItem.isEnabled = false
-            menu.addItem(errorItem)
-        }
-
-        if model.snapshots.isEmpty {
-            let item = NSMenuItem(title: "显示器：无在线设备", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        } else {
-            for snapshot in model.snapshots {
-                let name = snapshot.fingerprint.displayName.isEmpty
-                    ? "显示器 \(snapshot.displayID)"
-                    : snapshot.fingerprint.displayName
-                let mode = snapshot.mode?.shortDescription ?? "未知模式"
-                let builtinTag = snapshot.isBuiltin ? " [内置]" : ""
-                let item = NSMenuItem(title: "显示器：\(name)\(builtinTag) · \(mode)", action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                menu.addItem(item)
-            }
-        }
-
-        let plug = NSMenuItem(title: "插座：\(model.plugStateText)", action: nil, keyEquivalent: "")
-        plug.isEnabled = false
-        menu.addItem(plug)
-
-        let hid = NSMenuItem(
-            title: "MSI HID：\(model.msiStatus?.connected == true ? "已连接" : "未连接") · 模式：\(model.msiStatus?.mode.rawValue ?? "未知")",
-            action: nil,
-            keyEquivalent: ""
-        )
-        hid.isEnabled = false
-        menu.addItem(hid)
-        menu.addItem(.separator())
-
-        let automatic = NSMenuItem(title: "自动恢复", action: #selector(toggleAutomaticRecovery(_:)), keyEquivalent: "")
-        automatic.target = self
-        automatic.state = model.automaticRecoveryEnabled ? .on : .off
-        menu.addItem(automatic)
-
-        let recover = NSMenuItem(title: "立即恢复双屏", action: #selector(triggerRecovery), keyEquivalent: "r")
-        recover.target = self
-        recover.isEnabled = !model.recoveryStatus.recoveryInProgress
-        menu.addItem(recover)
-
-        if model.recoveryStatus.recoveryInProgress {
-            let cancel = NSMenuItem(title: "取消恢复并收尾", action: #selector(cancelRecovery), keyEquivalent: "")
-            cancel.target = self
-            menu.addItem(cancel)
-        }
-
-        if model.recoveryStatus.isStopped {
-            let clearStopItem = NSMenuItem(title: "解除停止状态", action: #selector(clearStop), keyEquivalent: "")
-            clearStopItem.target = self
-            menu.addItem(clearStopItem)
-        }
-
-        let panel = NSMenuItem(title: "打开控制面板…", action: #selector(openPanel), keyEquivalent: ",")
-        panel.target = self
-        menu.addItem(panel)
-
-        let refresh = NSMenuItem(title: "刷新", action: #selector(refresh), keyEquivalent: "")
-        refresh.target = self
-        menu.addItem(refresh)
-        menu.addItem(.separator())
-
-        let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
         statusItem.menu = menu
     }
 }
 
-@MainActor
-private final class RecoveryPanelController: NSWindowController, NSWindowDelegate {
-    private let model: AppModel
-    private let statusLabel = NSTextField(labelWithString: "")
-    private let errorLabel = NSTextField(labelWithString: "")
-    private let displaysLabel = NSTextField(labelWithString: "")
-    private let roleButtonsStack = NSStackView()
-    private let rolesLabel = NSTextField(labelWithString: "")
-    private let plugLabel = NSTextField(labelWithString: "")
-    private let hidLabel = NSTextField(labelWithString: "")
-    private let hostField = NSTextField(string: "")
-    private let modelField = NSTextField(string: "")
-    private let tokenField = NSSecureTextField(string: "")
-    private let automaticButton = NSButton(checkboxWithTitle: "自动恢复", target: nil, action: nil)
-    private let clearStopButton = NSButton(title: "解除停止", target: nil, action: nil)
-    private var isDraftInitialized = false
+// MARK: - Main Window Controller
 
-    init(model: AppModel) {
+@MainActor
+private final class ScreenPilotWindowController: NSWindowController, NSWindowDelegate {
+    private let model: AppModel
+
+    // 1. 状态区
+    private let statusMessageLabel = NSTextField(labelWithString: "Ready")
+    private let displaySummaryLabel = NSTextField(labelWithString: "")
+    private let rolesLabel = NSTextField(labelWithString: "")
+
+    // 2. 按钮区
+    private let turnOffButton = NSButton(title: "Turn Off", target: nil, action: nil)
+    private let turnOnButton = NSButton(title: "Turn On", target: nil, action: nil)
+    private let lowerResButton = NSButton(title: "Lower Resolution", target: nil, action: nil)
+    private let restoreFullResButton = NSButton(title: "Restore Full Resolution", target: nil, action: nil)
+    private let checkStatusButton = NSButton(title: "Check Status", target: nil, action: nil)
+    private let verifyBothScreensButton = NSButton(title: "Verify Both Screens", target: nil, action: nil)
+    private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
+
+    // 3. 日志区
+    private let logTextView = NSTextView()
+    private let logScrollView = NSScrollView()
+    private let copyLogButton = NSButton(title: "Copy Log", target: nil, action: nil)
+    private let exportLogButton = NSButton(title: "Export Log", target: nil, action: nil)
+
+    private var screenChangeObserver: NSObjectProtocol?
+    private var onClose: (() -> Void)?
+
+    init(model: AppModel, onClose: (() -> Void)? = nil) {
         self.model = model
+        self.onClose = onClose
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 530),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 620),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "双显示器自动恢复"
+        window.title = "ScreenPilot"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 580, height: 500)
+        window.setContentSize(NSSize(width: 680, height: 620))
         window.center()
         super.init(window: window)
         window.delegate = self
-        buildView()
-        initDraftFields()
+        buildUI()
         refresh()
+
+        // 监听显示器拓扑变化，确保窗口在屏幕拔出后依然在有效可视区域内
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.ensureWindowOnAvailableScreen()
+            }
+        }
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        if let observer = screenChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose?()
+    }
 
     override func showWindow(_ sender: Any?) {
+        if window?.isMiniaturized == true {
+            window?.deminiaturize(sender)
+        }
+        window?.makeKeyAndOrderFront(sender)
         super.showWindow(sender)
-        initDraftFields()
+        ensureWindowOnAvailableScreen()
         refresh()
     }
 
-    private func initDraftFields() {
-        guard !isDraftInitialized else { return }
-        hostField.stringValue = model.appConfiguration.plug.host
-        modelField.stringValue = model.appConfiguration.plug.model
-        tokenField.stringValue = ""
-        isDraftInitialized = true
+    private func ensureWindowOnAvailableScreen() {
+        guard let window else { return }
+        let currentFrame = window.frame
+        let isVisibleOnAnyScreen = NSScreen.screens.contains { screen in
+            screen.visibleFrame.intersects(currentFrame)
+        }
+        if !isVisibleOnAnyScreen {
+            if let mainScreen = NSScreen.main {
+                let screenFrame = mainScreen.visibleFrame
+                let newOrigin = NSPoint(
+                    x: screenFrame.origin.x + (screenFrame.width - currentFrame.width) / 2,
+                    y: screenFrame.origin.y + (screenFrame.height - currentFrame.height) / 2
+                )
+                window.setFrameOrigin(newOrigin)
+            } else {
+                window.center()
+            }
+        }
     }
 
     func refresh() {
-        let stageStr = model.recoveryStatus.stage.rawValue
-        let attemptStr = model.recoveryStatus.attemptCount > 0 ? " · 尝试 \(model.recoveryStatus.attemptCount)/3" : ""
-        let stoppedStr = model.recoveryStatus.isStopped ? " 【已停止】" : ""
-        let pending4KStr = model.recoveryStatus.modePending4K ? " 【待恢复到 4K】" : ""
-
-        statusLabel.stringValue = "阶段：[\(stageStr)] \(model.recoveryStatus.message)\(attemptStr)\(stoppedStr)\(pending4KStr)"
-        errorLabel.stringValue = (model.recoveryStatus.lastError ?? model.lastError).map { "异常信息：\($0)" } ?? ""
-        displaysLabel.stringValue = displaySummary()
-        rebuildRoleButtons()
-        rolesLabel.stringValue = "插座屏：\(model.roleName(.powerControlled))\n模式屏：\(model.roleName(.modeSwitch))"
-        plugLabel.stringValue = "插座：\(model.plugStateText)"
-        hidLabel.stringValue = "MSI HID：\(model.msiStatus?.connected == true ? "已连接" : "未连接") · 模式：\(model.msiStatus?.mode.rawValue ?? "未知")"
-        automaticButton.state = model.automaticRecoveryEnabled ? .on : .off
-        clearStopButton.isHidden = !model.recoveryStatus.isStopped
-    }
-
-    private func rebuildRoleButtons() {
-        roleButtonsStack.arrangedSubviews.forEach { view in
-            roleButtonsStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
+        // 更新状态提示
+        statusMessageLabel.stringValue = model.statusMessage
+        if model.isBusy {
+            statusMessageLabel.textColor = .systemBlue
+        } else if model.lastActionResult?.outcome == .failed {
+            statusMessageLabel.textColor = .systemRed
+        } else if model.lastActionResult?.outcome == .succeeded {
+            statusMessageLabel.textColor = .systemGreen
+        } else {
+            statusMessageLabel.textColor = .labelColor
         }
-        roleButtonsStack.orientation = .vertical
-        roleButtonsStack.alignment = .leading
-        roleButtonsStack.spacing = 5
-        for snapshot in model.snapshots {
-            let row = NSStackView()
-            row.orientation = .horizontal
-            row.spacing = 6
-            let name = snapshot.fingerprint.displayName.isEmpty
-                ? "显示器 \(snapshot.displayID)"
-                : snapshot.fingerprint.displayName
-            let builtinTag = snapshot.isBuiltin ? " [内置]" : ""
-            let label = NSTextField(labelWithString: "\(name)\(builtinTag)")
-            label.font = .systemFont(ofSize: 11)
-            label.widthAnchor.constraint(equalToConstant: 210).isActive = true
-            row.addArrangedSubview(label)
 
-            let power = NSButton(title: "设为插座屏", target: self, action: #selector(assignPowerDisplay(_:)))
-            power.tag = Int(snapshot.displayID)
-            power.bezelStyle = .rounded
-            power.controlSize = .small
-            power.isEnabled = !snapshot.isBuiltin
-            row.addArrangedSubview(power)
+        // 显示器摘要
+        if model.snapshots.isEmpty {
+            displaySummaryLabel.stringValue = "Displays: No active displays detected."
+        } else {
+            let lines = model.snapshots.map { s in
+                let name = s.fingerprint.displayName.isEmpty ? "Display \(s.displayID)" : s.fingerprint.displayName
+                let modeDesc = s.mode?.shortDescription ?? "Unknown mode"
+                let builtin = s.isBuiltin ? " [Builtin]" : ""
+                return "• \(name)\(builtin): \(modeDesc)"
+            }
+            displaySummaryLabel.stringValue = lines.joined(separator: "\n")
+        }
 
-            let mode = NSButton(title: "设为模式屏", target: self, action: #selector(assignModeDisplay(_:)))
-            mode.tag = Int(snapshot.displayID)
-            mode.bezelStyle = .rounded
-            mode.controlSize = .small
-            mode.isEnabled = !snapshot.isBuiltin
-            row.addArrangedSubview(mode)
-            roleButtonsStack.addArrangedSubview(row)
+        rolesLabel.stringValue = "ANT display: \(model.roleName(.powerControlled))   |   MSI display: \(model.roleName(.modeSwitch))"
+
+        // 按钮启用状态
+        let busy = model.isBusy
+        turnOffButton.isEnabled = !busy
+        turnOnButton.isEnabled = !busy
+        lowerResButton.isEnabled = !busy
+        restoreFullResButton.isEnabled = !busy
+        checkStatusButton.isEnabled = !busy
+        verifyBothScreensButton.isEnabled = !busy
+
+        stopButton.isEnabled = busy
+        stopButton.contentTintColor = busy ? .systemRed : .disabledControlTextColor
+
+        // 更新日志视图
+        updateLogText()
+    }
+
+    private func updateLogText() {
+        let currentLogs = model.logs.joined(separator: "\n")
+        guard logTextView.string != currentLogs else { return }
+
+        let clipView = logScrollView.contentView
+        let wasAtBottom = (clipView.bounds.origin.y + clipView.bounds.height) >= (logTextView.frame.height - 30)
+
+        logTextView.string = currentLogs
+
+        if wasAtBottom {
+            logTextView.scrollToEndOfDocument(nil)
         }
     }
 
-    private func displaySummary() -> String {
-        guard !model.snapshots.isEmpty else { return "显示器：当前没有在线设备" }
-        return model.snapshots.map { snapshot in
-            let name = snapshot.fingerprint.displayName.isEmpty
-                ? "显示器 \(snapshot.displayID)"
-                : snapshot.fingerprint.displayName
-            let mode = snapshot.mode?.shortDescription ?? "未知模式"
-            let builtin = snapshot.isBuiltin ? " (内置屏)" : ""
-            return "显示器：\(name)\(builtin) · \(mode)"
-        }.joined(separator: "\n")
-    }
-
-    private func buildView() {
+    private func buildUI() {
         guard let contentView = window?.contentView else { return }
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let heading = NSTextField(labelWithString: "双显示器自动恢复")
-        heading.font = .systemFont(ofSize: 20, weight: .bold)
-        stack.addArrangedSubview(heading)
-        for label in [statusLabel, errorLabel, displaysLabel, rolesLabel, plugLabel, hidLabel] {
-            label.font = .systemFont(ofSize: 12)
-            label.maximumNumberOfLines = 4
-            label.lineBreakMode = .byWordWrapping
-            label.translatesAutoresizingMaskIntoConstraints = false
-            stack.addArrangedSubview(label)
-        }
-        stack.addArrangedSubview(roleButtonsStack)
+        let rootStack = NSStackView()
+        rootStack.orientation = .vertical
+        rootStack.alignment = .leading
+        rootStack.spacing = 14
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let configurationBox = NSStackView()
-        configurationBox.orientation = .vertical
-        configurationBox.alignment = .leading
-        configurationBox.spacing = 6
-        let boxTitle = NSTextField(labelWithString: "插座配置（Token 存储在本地 secrets.json 且权限 0600）")
-        boxTitle.font = .systemFont(ofSize: 13, weight: .semibold)
-        configurationBox.addArrangedSubview(boxTitle)
-        configurationBox.addArrangedSubview(labeledField("型号", field: modelField))
-        configurationBox.addArrangedSubview(labeledField("IP 地址", field: hostField))
-        configurationBox.addArrangedSubview(labeledField("Token", field: tokenField))
-        stack.addArrangedSubview(configurationBox)
+        // 1. Status Section
+        let statusBox = NSStackView()
+        statusBox.orientation = .vertical
+        statusBox.alignment = .leading
+        statusBox.spacing = 6
 
-        let optionRow = NSStackView()
-        optionRow.spacing = 12
-        automaticButton.target = self
-        automaticButton.action = #selector(toggleAutomatic)
-        optionRow.addArrangedSubview(automaticButton)
+        let appTitle = NSTextField(labelWithString: "ScreenPilot")
+        appTitle.font = .systemFont(ofSize: 18, weight: .bold)
+        statusBox.addArrangedSubview(appTitle)
 
-        clearStopButton.target = self
-        clearStopButton.action = #selector(clearStopClicked)
-        clearStopButton.bezelStyle = .rounded
-        clearStopButton.contentTintColor = .systemRed
-        clearStopButton.isHidden = true
-        optionRow.addArrangedSubview(clearStopButton)
-        stack.addArrangedSubview(optionRow)
+        statusMessageLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        statusBox.addArrangedSubview(statusMessageLabel)
 
-        let actions = NSStackView()
-        actions.spacing = 8
-        let save = NSButton(title: "保存设置", target: self, action: #selector(saveSettings))
-        save.bezelStyle = .rounded
-        let recover = NSButton(title: "立即恢复双屏", target: self, action: #selector(triggerRecovery))
-        recover.bezelStyle = .rounded
-        let refreshButton = NSButton(title: "刷新", target: self, action: #selector(refreshNow))
-        refreshButton.bezelStyle = .rounded
-        let importKeyBtn = NSButton(title: "从 Keychain 导入", target: self, action: #selector(importKeychain))
-        importKeyBtn.bezelStyle = .rounded
-        let exportButton = NSButton(title: "导出脱敏日志", target: self, action: #selector(exportLog))
-        exportButton.bezelStyle = .rounded
-        let deleteTokenButton = NSButton(title: "删除 Token", target: self, action: #selector(deleteToken))
-        deleteTokenButton.bezelStyle = .rounded
+        displaySummaryLabel.font = .systemFont(ofSize: 11)
+        displaySummaryLabel.maximumNumberOfLines = 5
+        displaySummaryLabel.lineBreakMode = .byWordWrapping
+        statusBox.addArrangedSubview(displaySummaryLabel)
 
-        actions.addArrangedSubview(save)
-        actions.addArrangedSubview(recover)
-        let cancel = NSButton(title: "取消并收尾", target: self, action: #selector(cancelRecoveryClicked))
-        cancel.bezelStyle = .rounded
-        actions.addArrangedSubview(cancel)
-        actions.addArrangedSubview(refreshButton)
-        stack.addArrangedSubview(actions)
-        let secondaryActions = NSStackView(views: [importKeyBtn, exportButton, deleteTokenButton])
-        secondaryActions.spacing = 8
-        stack.addArrangedSubview(secondaryActions)
+        rolesLabel.font = .systemFont(ofSize: 11)
+        rolesLabel.textColor = .secondaryLabelColor
+        statusBox.addArrangedSubview(rolesLabel)
+        rootStack.addArrangedSubview(statusBox)
 
-        contentView.addSubview(stack)
+        // 2. Actions Section
+        let actionsBox = NSStackView()
+        actionsBox.orientation = .vertical
+        actionsBox.alignment = .leading
+        actionsBox.spacing = 8
+
+        let actionsTitle = NSTextField(labelWithString: "Actions")
+        actionsTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        actionsBox.addArrangedSubview(actionsTitle)
+
+        // Row 1: ANT display controls
+        let antRow = NSStackView()
+        antRow.orientation = .horizontal
+        antRow.spacing = 8
+        let antLabel = NSTextField(labelWithString: "ANT display:")
+        antLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        antLabel.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        configureButton(turnOffButton, title: "Turn Off", action: #selector(turnOffClicked))
+        configureButton(turnOnButton, title: "Turn On", action: #selector(turnOnClicked))
+        antRow.addArrangedSubview(antLabel)
+        antRow.addArrangedSubview(turnOffButton)
+        antRow.addArrangedSubview(turnOnButton)
+        actionsBox.addArrangedSubview(antRow)
+
+        // Row 2: MSI display controls
+        let msiRow = NSStackView()
+        msiRow.orientation = .horizontal
+        msiRow.spacing = 8
+        let msiLabel = NSTextField(labelWithString: "MSI display:")
+        msiLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        msiLabel.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        configureButton(lowerResButton, title: "Lower Resolution", action: #selector(lowerResClicked))
+        configureButton(restoreFullResButton, title: "Restore Full Resolution", action: #selector(restoreFullResClicked))
+        msiRow.addArrangedSubview(msiLabel)
+        msiRow.addArrangedSubview(lowerResButton)
+        msiRow.addArrangedSubview(restoreFullResButton)
+        actionsBox.addArrangedSubview(msiRow)
+
+        // Row 3: Inspection controls + Stop
+        let checkRow = NSStackView()
+        checkRow.orientation = .horizontal
+        checkRow.spacing = 8
+        let checkLabel = NSTextField(labelWithString: "Inspection:")
+        checkLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        checkLabel.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        configureButton(checkStatusButton, title: "Check Status", action: #selector(checkStatusClicked))
+        configureButton(verifyBothScreensButton, title: "Verify Both Screens", action: #selector(verifyBothScreensClicked))
+        configureButton(stopButton, title: "Stop", action: #selector(stopClicked))
+        stopButton.bezelStyle = .rounded
+        stopButton.isEnabled = false
+
+        checkRow.addArrangedSubview(checkLabel)
+        checkRow.addArrangedSubview(checkStatusButton)
+        checkRow.addArrangedSubview(verifyBothScreensButton)
+        checkRow.addArrangedSubview(stopButton)
+        actionsBox.addArrangedSubview(checkRow)
+
+        rootStack.addArrangedSubview(actionsBox)
+
+        // 3. Execution Log Section
+        let logHeaderRow = NSStackView()
+        logHeaderRow.orientation = .horizontal
+        logHeaderRow.spacing = 10
+        let logTitle = NSTextField(labelWithString: "Execution Log")
+        logTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        configureButton(copyLogButton, title: "Copy Log", action: #selector(copyLogClicked))
+        configureButton(exportLogButton, title: "Export Log", action: #selector(exportLogClicked))
+        logHeaderRow.addArrangedSubview(logTitle)
+        logHeaderRow.addArrangedSubview(copyLogButton)
+        logHeaderRow.addArrangedSubview(exportLogButton)
+        rootStack.addArrangedSubview(logHeaderRow)
+
+        // Log text view
+        logTextView.isEditable = false
+        logTextView.isSelectable = true
+        logTextView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        logTextView.autoresizingMask = [.width]
+
+        logScrollView.documentView = logTextView
+        logScrollView.hasVerticalScroller = true
+        logScrollView.hasHorizontalScroller = false
+        logScrollView.borderType = .bezelBorder
+        logScrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        rootStack.addArrangedSubview(logScrollView)
+
+        contentView.addSubview(rootStack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -20),
-            hostField.widthAnchor.constraint(equalToConstant: 270),
-            modelField.widthAnchor.constraint(equalToConstant: 270),
-            tokenField.widthAnchor.constraint(equalToConstant: 270)
+            rootStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 18),
+            rootStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -18),
+            contentView.topAnchor.constraint(equalTo: rootStack.topAnchor, constant: 18),
+            rootStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: 18),
+
+            rootStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 580),
+            logScrollView.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            logScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 240)
         ])
     }
 
-    private func labeledField(_ title: String, field: NSTextField) -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 8
-        let label = NSTextField(labelWithString: title)
-        label.alignment = .right
-        label.widthAnchor.constraint(equalToConstant: 55).isActive = true
-        row.addArrangedSubview(label)
-        row.addArrangedSubview(field)
-        return row
+    private func configureButton(_ button: NSButton, title: String, action: Selector) {
+        button.title = title
+        button.target = self
+        button.action = action
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
     }
 
-    @objc private func toggleAutomatic() {
-        model.automaticRecoveryEnabled = automaticButton.state == .on
+    // MARK: - Button Actions
+
+    @objc private func turnOffClicked() {
+        model.execute(.powerOff)
     }
 
-    @objc private func clearStopClicked() {
-        model.clearStop()
+    @objc private func turnOnClicked() {
+        model.execute(.powerOn)
     }
 
-    @objc private func importKeychain() {
-        model.importLegacyKeychainToken()
-        initDraftFields()
-        refresh()
+    @objc private func lowerResClicked() {
+        model.execute(.lowerResolution)
     }
 
-    @objc private func assignPowerDisplay(_ sender: NSButton) {
-        guard let snapshot = model.snapshots.first(where: { Int($0.displayID) == sender.tag }) else { return }
-        model.useAsPowerControlled(snapshot)
-        refresh()
+    @objc private func restoreFullResClicked() {
+        model.execute(.restoreFullResolution)
     }
 
-    @objc private func assignModeDisplay(_ sender: NSButton) {
-        guard let snapshot = model.snapshots.first(where: { Int($0.displayID) == sender.tag }) else { return }
-        model.useAsModeSwitch(snapshot)
-        refresh()
+    @objc private func checkStatusClicked() {
+        model.execute(.checkStatus)
     }
 
-    @objc private func saveSettings() {
-        model.saveSettings(model: modelField.stringValue, host: hostField.stringValue, token: tokenField.stringValue) { [weak self] succeeded in
-            if succeeded { self?.tokenField.stringValue = "" }
-        }
-        refresh()
+    @objc private func verifyBothScreensClicked() {
+        model.execute(.verifyBothScreens)
     }
 
-    @objc private func cancelRecoveryClicked() { model.cancelRecovery() }
-
-    @objc private func triggerRecovery() {
-        model.triggerRecovery()
+    @objc private func stopClicked() {
+        model.stop()
     }
 
-    @objc private func refreshNow() {
-        Task { @MainActor in await model.refresh(); refresh() }
+    @objc private func copyLogClicked() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(logTextView.string, forType: .string)
     }
 
-    @objc private func exportLog() {
+    @objc private func exportLogClicked() {
         guard let url = model.exportRedactedLog() else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
-    }
-
-    @objc private func deleteToken() {
-        model.deleteToken()
-        tokenField.stringValue = ""
-        refresh()
     }
 }

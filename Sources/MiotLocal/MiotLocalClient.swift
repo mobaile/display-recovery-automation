@@ -31,25 +31,25 @@ public enum MiotLocalError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .invalidHost:
-            return "插座 IP 地址无效"
+            return "Smart plug IP address is invalid."
         case .invalidToken:
-            return "插座 token 无效"
+            return "Smart plug token is invalid."
         case .socketCreationFailed(let reason):
-            return "创建局域网连接失败：\(reason)"
+            return "Failed to create socket: \(reason)"
         case .socketConnectionFailed(let reason):
-            return "连接插座失败：\(reason)"
+            return "Failed to connect to smart plug: \(reason)"
         case .sendFailed(let reason):
-            return "发送插座命令失败：\(reason)"
+            return "Failed to send smart plug command: \(reason)"
         case .receiveTimedOut:
-            return "插座响应超时"
+            return "Smart plug response timed out."
         case .malformedPacket:
-            return "插座返回了无法解析的数据包"
+            return "Smart plug returned an unparseable packet."
         case .decryptionFailed:
-            return "插座响应解密失败"
+            return "Failed to decrypt smart plug response."
         case .invalidResponse(let reason):
-            return "插座返回无效结果：\(reason)"
+            return "Smart plug returned invalid response: \(reason)"
         case .deviceError(let reason):
-            return "插座拒绝命令：\(reason)"
+            return "Smart plug rejected command: \(reason)"
         }
     }
 }
@@ -92,11 +92,11 @@ public final class MiotLocalClient: @unchecked Sendable {
                 // 控制命令最多发送一次；不确定是否执行时优先查询实际状态。
                 let payload = try self.sendSynchronously(method: "set_properties", params: [["siid": 2, "piid": 1, "value": on]], deadline: deadline)
                 guard Self.isSuccessfulSetPropertiesResult(payload["result"]) else {
-                    throw MiotLocalError.invalidResponse("开关命令未返回有效成功状态")
+                    throw MiotLocalError.invalidResponse("Power command did not return success code.")
                 }
             } catch {
                 let original = error
-                try deadline.check("确认插座写入结果")
+                try deadline.check("Verifying smart plug write result")
                 self.resetSession()
                 let actual = try? self.power(self.requestRead("get_properties", params: [["siid": 2, "piid": 1]], deadline: deadline))
                 guard actual == on else { throw original }
@@ -116,7 +116,7 @@ public final class MiotLocalClient: @unchecked Sendable {
                     } catch { continuation.resume(throwing: error) }
                 }
             }
-        } onCancel: { deadline.cancellation.cancel("插座操作已取消") }
+        } onCancel: { deadline.cancellation.cancel("Smart plug operation cancelled.") }
     }
     private func validateLocked(_ expected: String, deadline: RecoveryDeadline) throws -> MiotDeviceInfo {
         try deadline.check()
@@ -128,14 +128,14 @@ public final class MiotLocalClient: @unchecked Sendable {
     }
     private func info(_ payload: [String: Any]) throws -> MiotDeviceInfo {
         guard let result = firstResultDictionary(payload), let model = result["model"] as? String else {
-            throw MiotLocalError.invalidResponse("缺少 model")
+            throw MiotLocalError.invalidResponse("Missing model in response.")
         }
         return MiotDeviceInfo(model: model, firmwareVersion: result["fw_ver"] as? String, hardwareVersion: result["hw_ver"] as? String)
     }
     private func power(_ payload: [String: Any]) throws -> Bool {
         guard let results = payload["result"] as? [[String: Any]], results.count == 1,
               let result = results.first, let code = result["code"] as? NSNumber, code.intValue == 0,
-              let value = result["value"] as? Bool else { throw MiotLocalError.invalidResponse("开关状态缺失或读取失败") }
+              let value = result["value"] as? Bool else { throw MiotLocalError.invalidResponse("Power state missing or failed to read.") }
         return value
     }
     private static func isSuccessfulSetPropertiesResult(_ value: Any?) -> Bool {
@@ -163,7 +163,7 @@ public final class MiotLocalClient: @unchecked Sendable {
             let hello = try sendPacket(Self.helloPacket(), deadline: deadline)
             guard hello.count == 32, hello.readUInt16BE(at: 0) == 0x2131 else { throw MiotLocalError.malformedPacket }
             let identity = hello.readUInt32BE(at: 8)
-            if let boundDeviceID, boundDeviceID != identity { throw MiotLocalError.invalidResponse("插座设备身份发生变化") }
+            if let boundDeviceID, boundDeviceID != identity { throw MiotLocalError.invalidResponse("Smart plug device identity changed.") }
             boundDeviceID = identity; deviceID = identity
             deviceTimeBase = hello.readUInt32BE(at: 12); localTimeBase = deadline.clock.monotonicNow
         }
@@ -178,14 +178,14 @@ public final class MiotLocalClient: @unchecked Sendable {
         let response = try sendPacket(packet, deadline: deadline)
         let result = try decodeResponse(response)
         guard let responseID = result["id"] as? NSNumber, responseID.uint32Value == requestID else {
-            throw MiotLocalError.invalidResponse("响应缺少匹配的请求编号")
+            throw MiotLocalError.invalidResponse("Response missing matching request ID.")
         }
-        guard response.readUInt32BE(at: 8) == deviceID else { throw MiotLocalError.invalidResponse("响应设备编号不匹配") }
+        guard response.readUInt32BE(at: 8) == deviceID else { throw MiotLocalError.invalidResponse("Response device ID mismatch.") }
         deviceTimeBase = response.readUInt32BE(at: 12); localTimeBase = deadline.clock.monotonicNow
         return result
     }
     private func sendPacket(_ packet: Data, deadline: RecoveryDeadline) throws -> Data {
-        try deadline.check("插座 UDP 通信")
+        try deadline.check("Smart plug UDP communication")
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw MiotLocalError.socketCreationFailed(String(cString: strerror(errno))) }
         defer { close(fd) }
@@ -195,12 +195,12 @@ public final class MiotLocalClient: @unchecked Sendable {
         guard inet_pton(AF_INET, host, &address.sin_addr) == 1 else { throw MiotLocalError.invalidHost }
         let connected = withUnsafePointer(to: &address) { ptr in ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
         guard connected == 0 else { throw MiotLocalError.socketConnectionFailed(String(cString: strerror(errno))) }
-        try deadline.check("发送插座命令")
+        try deadline.check("Send smart plug command")
         let sent = packet.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
         guard sent == packet.count else { throw MiotLocalError.sendFailed(String(cString: strerror(errno))) }
         let responseDeadline = min(deadline.expiresAt, deadline.clock.monotonicNow + 3)
         while deadline.clock.monotonicNow < responseDeadline {
-            try deadline.check("等待插座应答")
+            try deadline.check("Wait for smart plug response")
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let milliseconds = Int32(max(1, min(50, (responseDeadline - deadline.clock.monotonicNow) * 1000)))
             let ready = poll(&descriptor, 1, milliseconds)
@@ -216,7 +216,7 @@ public final class MiotLocalClient: @unchecked Sendable {
                 throw MiotLocalError.sendFailed(String(cString: strerror(errno)))
             }
             response.removeSubrange(count..<response.count)
-            try deadline.check("等待插座应答")
+            try deadline.check("Wait for smart plug response")
             return response
         }
         throw MiotLocalError.receiveTimedOut
@@ -261,17 +261,17 @@ public final class MiotLocalClient: @unchecked Sendable {
         checksumInput.append(token)
         checksumInput.append(payload)
         guard Self.md5(checksumInput) == packet.subdata(in: 16..<32) else {
-            throw MiotLocalError.invalidResponse("校验和不匹配")
+            throw MiotLocalError.invalidResponse("Checksum mismatch.")
         }
         guard let decrypted = try? Self.decrypt(payload, token: token) else {
             throw MiotLocalError.decryptionFailed
         }
         guard let object = try? JSONSerialization.jsonObject(with: decrypted),
               let dictionary = object as? [String: Any] else {
-            throw MiotLocalError.invalidResponse("JSON 无效")
+            throw MiotLocalError.invalidResponse("Invalid JSON.")
         }
         if let error = dictionary["error"] as? [String: Any] {
-            throw MiotLocalError.deviceError(error["message"] as? String ?? "未知错误")
+            throw MiotLocalError.deviceError(error["message"] as? String ?? "Unknown error.")
         }
         return dictionary
     }

@@ -2,49 +2,104 @@ import Foundation
 
 public final class RecoveryLogStore: @unchecked Sendable {
     public let url: URL
+    public let legacyUrl: URL
     private let lock = NSLock()
     private let formatter: ISO8601DateFormatter
     private var lastMessage: String?
     private var repeatCount = 0
     private let maxFileSize: Int64 = 2 * 1024 * 1024 // 2MB
+    private let maxInMemoryLogs = 500
+    private var memoryBuffer: [String] = []
+    private var subscribers: [UUID: @Sendable (String) -> Void] = [:]
 
     public init(url: URL? = nil) {
+        let logsDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library")
+        let baseDir = logsDir.appendingPathComponent("Logs/DisplayRecoveryAutomation", isDirectory: true)
+
         if let url {
             self.url = url
+            self.legacyUrl = url.deletingLastPathComponent().appendingPathComponent("recovery.log")
         } else {
-            let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
-                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library")
-            self.url = logs
-                .appendingPathComponent("Logs/DisplayRecoveryAutomation", isDirectory: true)
-                .appendingPathComponent("recovery.log")
+            self.url = baseDir.appendingPathComponent("screenpilot.log")
+            self.legacyUrl = baseDir.appendingPathComponent("recovery.log")
         }
+
         formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+
+    public func subscribe(_ subscriber: @escaping @Sendable (String) -> Void) -> UUID {
+        lock.lock()
+        defer { lock.unlock() }
+        let id = UUID()
+        subscribers[id] = subscriber
+        return id
+    }
+
+    public func unsubscribe(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        subscribers.removeValue(forKey: id)
+    }
+
+    public func recentLogs() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return memoryBuffer
     }
 
     public func append(_ message: String, transactionID: String? = nil) {
-        lock.lock()
-        defer { lock.unlock() }
-
         let redacted = Self.redact(message)
         let formattedMsg = transactionID.map { "[\($0)] \(redacted)" } ?? redacted
 
-        // 去重检查：相同消息只记录计数
+        var callbacks: [@Sendable (String) -> Void] = []
+        var linesToEmit: [String] = []
+
+        lock.lock()
         if formattedMsg == lastMessage {
             repeatCount += 1
+            lock.unlock()
             return
         }
 
         if repeatCount > 0 {
-            writeLine("（上一条消息重复 \(repeatCount) 次）")
+            let repeatText = "[\(formatter.string(from: Date()))] (Previous message repeated \(repeatCount) times)"
+            linesToEmit.append(repeatText)
+            appendMemoryLocked(repeatText)
         }
         repeatCount = 0
-
         lastMessage = formattedMsg
-        NSLog("DisplayRecovery: %@", formattedMsg)
-        writeLine(formattedMsg)
+
+        let timestamp = formatter.string(from: Date())
+        let line = "[\(timestamp)] \(formattedMsg)"
+        linesToEmit.append(line)
+        appendMemoryLocked(line)
+
+        callbacks = Array(subscribers.values)
+        lock.unlock()
+
+        // 发送给订阅者（锁外调用）
+        for line in linesToEmit {
+            for cb in callbacks {
+                cb(line)
+            }
+        }
+
+        // 写入文件
+        for line in linesToEmit {
+            writeLine(line)
+        }
     }
 
-    private func writeLine(_ text: String) {
+    private func appendMemoryLocked(_ line: String) {
+        memoryBuffer.append(line)
+        if memoryBuffer.count > maxInMemoryLogs {
+            memoryBuffer.removeFirst(memoryBuffer.count - maxInMemoryLogs)
+        }
+    }
+
+    private func writeLine(_ formattedLine: String) {
         do {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
@@ -53,8 +108,8 @@ public final class RecoveryLogStore: @unchecked Sendable {
 
             rotateIfNeeded()
 
-            let line = "[\(formatter.string(from: Date()))] \(text)\n"
-            if let data = line.data(using: .utf8) {
+            let text = formattedLine + "\n"
+            if let data = text.data(using: .utf8) {
                 if FileManager.default.fileExists(atPath: url.path) {
                     let handle = try FileHandle(forWritingTo: url)
                     defer { try? handle.close() }
@@ -65,7 +120,7 @@ public final class RecoveryLogStore: @unchecked Sendable {
                 }
             }
         } catch {
-            // 日志写入失败不改变主流程
+            // 日志保存失败不阻止设备操作，内存日志仍显示
         }
     }
 
@@ -83,19 +138,35 @@ public final class RecoveryLogStore: @unchecked Sendable {
     public func redactedContents() -> String {
         lock.lock()
         defer { lock.unlock() }
-        let rotated = (try? String(contentsOf: url.appendingPathExtension("1"), encoding: .utf8)) ?? ""
-        let current = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        let repeats = repeatCount > 0 ? "（最后一条消息重复 \(repeatCount) 次）\n" : ""
-        let contents = rotated + current + repeats
-        return contents.isEmpty ? "暂无日志\n" : Self.redact(contents)
+
+        // 若当前文件尚无内容且存在旧日志，则包含旧日志
+        let currentRotated = (try? String(contentsOf: url.appendingPathExtension("1"), encoding: .utf8)) ?? ""
+        let currentFile = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let legacyFile = (FileManager.default.fileExists(atPath: legacyUrl.path) ? (try? String(contentsOf: legacyUrl, encoding: .utf8)) : nil) ?? ""
+
+        let repeats = repeatCount > 0 ? "[\(formatter.string(from: Date()))] (Last message repeated \(repeatCount) times)\n" : ""
+
+        var combined = ""
+        if !legacyFile.isEmpty {
+            combined += "--- Legacy Logs ---\n" + legacyFile + "\n--- ScreenPilot Logs ---\n"
+        }
+        combined += currentRotated + currentFile + repeats
+
+        if combined.isEmpty {
+            if !memoryBuffer.isEmpty {
+                return memoryBuffer.joined(separator: "\n") + "\n"
+            }
+            return "No logs available\n"
+        }
+        return Self.redact(combined)
     }
 
     public func exportRedacted(to destination: URL) throws {
         guard let data = redactedContents().data(using: .utf8) else {
             throw NSError(
-                domain: "DisplayRecoveryAutomation.LogStore",
+                domain: "ScreenPilot.LogStore",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "无法编码脱敏日志"]
+                userInfo: [NSLocalizedDescriptionKey: "Failed to encode redacted log content."]
             )
         }
         try data.write(to: destination, options: [.atomic])

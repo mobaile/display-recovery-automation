@@ -9,12 +9,13 @@ xcrun swift build -c release
 BIN_DIR="$(xcrun swift build -c release --show-bin-path)"
 
 DIST_DIR="$ROOT_DIR/dist"
-APP_DIR="$DIST_DIR/DisplayRecoveryAutomation.app"
+APP_DIR="$DIST_DIR/ScreenPilot.app"
+OLD_APP_DIR="$DIST_DIR/DisplayRecoveryAutomation.app"
 mkdir -p "$DIST_DIR"
-rm -rf "$APP_DIR"
+rm -rf "$APP_DIR" "$OLD_APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
-cp "$BIN_DIR/DisplayRecoveryApp" "$APP_DIR/Contents/MacOS/DisplayRecoveryApp"
+cp "$BIN_DIR/DisplayRecoveryApp" "$APP_DIR/Contents/MacOS/ScreenPilot"
 cp "$ROOT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 
 # 非沙盒应用需要访问 USB HID；临时 ad-hoc 签名便于本机直接启动。

@@ -7,3 +7,5 @@ DerivedData/
 secrets.json
 *.log
 display-recovery-log-*.txt
+screenpilot-log-*.txt
+screenpilot.log

@@ -21,7 +21,7 @@ public struct RecoveryDeadline: Sendable {
     }
 
     public var remaining: TimeInterval { max(0, expiresAt - clock.monotonicNow) }
-    public func check(_ operation: String = "硬件操作") throws {
+    public func check(_ operation: String = "operation") throws {
         if cancellation.reason != nil { throw CancellationError() }
         guard remaining > 0 else { throw RecoveryError.operationTimedOut(operation) }
     }

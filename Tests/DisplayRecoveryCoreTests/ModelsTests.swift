@@ -8,7 +8,7 @@ final class ModelsTests: XCTestCase {
         XCTAssertTrue(mode.approximatelyEquals(DisplayModeSignature(width: 3840, height: 2160, refreshRate: 144.5)))
         XCTAssertFalse(mode.approximatelyEquals(DisplayModeSignature(width: 3840, height: 2160, refreshRate: 146)))
         let unknownRefresh = DisplayModeSignature(width: 3840, height: 2160, refreshRate: 0)
-        XCTAssertEqual(unknownRefresh.shortDescription, "3840×2160 @ 未知")
+        XCTAssertEqual(unknownRefresh.shortDescription, "3840×2160 @ Unknown")
         XCTAssertTrue(unknownRefresh.approximatelyEquals(mode))
         XCTAssertFalse(unknownRefresh.approximatelyEquals(DisplayModeSignature(width: 2560, height: 1440, refreshRate: 144)))
     }

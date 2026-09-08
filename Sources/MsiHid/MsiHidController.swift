@@ -58,10 +58,10 @@ public final class MsiHidController: @unchecked Sendable {
     }
     public func setMode(_ mode: MsiHardwareDualMode, expectedIdentity: String, deadline: RecoveryDeadline) async throws {
         try await perform {
-            try deadline.check("MSI 模式写入")
+            try deadline.check("MSI mode write")
             guard mode != .unknown, let session = HIDSession() else { throw RecoveryError.monitorUnavailable }
             guard !session.isAmbiguous, session.identity == expectedIdentity else {
-                throw RecoveryError.ambiguousDisplay("MSI HID 写入目标不一致")
+                throw RecoveryError.ambiguousDisplay("MSI HID target mismatch")
             }
             try session.write("5b002E0" + (mode == .uhd ? "000" : "001"), deadline: deadline)
             // 仅代表指令已发出；确认由独立读回完成，不能编造成功缓存。
@@ -69,7 +69,7 @@ public final class MsiHidController: @unchecked Sendable {
         }
     }
     private func readOnce(deadline: RecoveryDeadline) throws -> MsiHidStatus {
-        try deadline.check("MSI HID 读取")
+        try deadline.check("MSI HID read")
         guard let session = HIDSession() else {
             let status = MsiHidStatus(connected: false)
             cacheLock.withLock { lastCachedStatus = status }
@@ -187,7 +187,7 @@ private final class HIDSession {
         try write(asciiCommand, deadline: deadline)
         let end = min(deadline.expiresAt, deadline.clock.monotonicNow + 0.3)
         repeat {
-            try deadline.check("等待 MSI HID 应答")
+            try deadline.check("Wait for MSI HID response")
             CFRunLoopRunInMode(CFRunLoopMode.defaultMode, min(0.01, deadline.remaining), false)
             for report in sink.reports() {
                 guard report.first == UInt8(reportID), let terminator = report.firstIndex(of: 0x0D), terminator > 1,
@@ -201,12 +201,12 @@ private final class HIDSession {
 
     func write(_ asciiCommand: String, deadline: RecoveryDeadline) throws {
         guard let device else { throw RecoveryError.monitorUnavailable }
-        try deadline.check("发送 MSI HID 报告")
+        try deadline.check("Send MSI HID report")
         sink.clear()
         // 清空上一请求的剩余输入，等待也计入同一个 deadline。
         CFRunLoopRunInMode(CFRunLoopMode.defaultMode, min(0.03, deadline.remaining), false)
         sink.clear()
-        try deadline.check("发送 MSI HID 报告")
+        try deadline.check("Send MSI HID report")
         let request = HIDOutputRequest(command: asciiCommand, reportID: UInt8(reportID), length: reportLength)
         let context = Unmanaged.passRetained(request).toOpaque()
         // SDK 将此参数定义为毫秒；异步接口避免同步 SetReport 阻塞执行器。
@@ -218,17 +218,17 @@ private final class HIDSession {
             }, context)
         guard result == kIOReturnSuccess else {
             Unmanaged<HIDOutputRequest>.fromOpaque(context).release()
-            throw RecoveryError.operationFailed("HID 报告提交失败：\(result)")
+            throw RecoveryError.operationFailed("HID report submission failed (\(result)).")
         }
         // 请求对象自行保有报告内存，超时后的迟到回调不会访问已释放的缓冲区。
         while request.result == nil {
-            try deadline.check("MSI HID 报告传输")
+            try deadline.check("MSI HID report transmission")
             CFRunLoopRunInMode(CFRunLoopMode.defaultMode, min(0.01, deadline.remaining), false)
         }
         guard request.result == kIOReturnSuccess else {
-            throw RecoveryError.operationFailed("HID 报告传输失败：\(request.result ?? kIOReturnError)")
+            throw RecoveryError.operationFailed("HID report transmission failed (\(request.result ?? kIOReturnError)).")
         }
-        try deadline.check("MSI HID 报告传输")
+        try deadline.check("MSI HID report transmission")
     }
 }
 

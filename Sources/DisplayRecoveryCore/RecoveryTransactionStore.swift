@@ -53,12 +53,12 @@ public struct RecoveryTransaction: Codable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         guard (1...2).contains(schemaVersion) else {
-            throw RecoveryError.operationFailed("不支持的事务版本：\(schemaVersion)")
+            throw RecoveryError.operationFailed("Unsupported transaction version: \(schemaVersion)")
         }
         id = try c.decode(UUID.self, forKey: .id)
         failureID = try c.decode(String.self, forKey: .failureID)
         attemptCount = try c.decode(Int.self, forKey: .attemptCount)
-        guard (0...3).contains(attemptCount) else { throw RecoveryError.operationFailed("事务尝试次数无效") }
+        guard (0...3).contains(attemptCount) else { throw RecoveryError.operationFailed("Invalid transaction attempt count.") }
         isStopped = try c.decode(Bool.self, forKey: .isStopped)
         stopReason = try c.decodeIfPresent(String.self, forKey: .stopReason)
         stage = try c.decode(RecoveryStage.self, forKey: .stage)
@@ -99,7 +99,7 @@ public enum AtomicPrivateFile {
         try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let temporary = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
         guard fm.createFile(atPath: temporary.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
-            throw RecoveryError.operationFailed("无法创建私有持久化文件")
+            throw RecoveryError.operationFailed("Failed to create private persistence file.")
         }
         defer { try? fm.removeItem(at: temporary) }
         let handle = try FileHandle(forWritingTo: temporary)

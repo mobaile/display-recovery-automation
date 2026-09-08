@@ -16,14 +16,14 @@ public struct DisplayModeSignature: Codable, Equatable, Hashable, Sendable {
     public var shortDescription: String {
         let refresh: String
         if refreshRate <= 0 {
-            refresh = "未知"
+            refresh = "Unknown"
         } else {
             refresh = refreshRate.rounded() == refreshRate
                 ? String(format: "%.0f", refreshRate)
                 : String(format: "%.2f", refreshRate)
         }
         return refreshRate <= 0
-            ? "\(width)×\(height) @ 未知"
+            ? "\(width)×\(height) @ Unknown"
             : "\(width)×\(height) @ \(refresh)Hz"
     }
 
@@ -348,7 +348,7 @@ public struct RecoveryStatus: Equatable, Sendable {
     public init(
         state: RecoveryState = .idle,
         stage: RecoveryStage = .idle,
-        message: String = "等待显示器状态",
+        message: String = "Waiting for display status",
         lastError: String? = nil,
         updatedAt: Date = Date(),
         recoveryInProgress: Bool = false,
@@ -419,27 +419,27 @@ public enum RecoveryError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .incompleteDisplayConfiguration:
-            return "显示器角色配置不完整"
+            return "Display role configuration is incomplete."
         case .displayNotFound(let name):
-            return "未找到显示器：\(name)"
+            return "Display not found: \(name)"
         case .ambiguousDisplay(let name):
-            return "发现多个匹配候选：\(name)"
+            return "Multiple matching displays found: \(name)"
         case .modeNotAvailable(let mode):
-            return "显示器不支持模式：\(mode.shortDescription)"
+            return "Display does not support mode: \(mode.shortDescription)"
         case .plugNotConfigured:
-            return "智能插座尚未配置"
+            return "Smart plug is not configured."
         case .plugModelMismatch(let expected, let actual):
-            return "插座型号不匹配：期望 \(expected)，实际 \(actual)"
+            return "Smart plug model mismatch: expected \(expected), got \(actual)"
         case .plugUnavailable(let reason):
-            return "智能插座不可用：\(reason)"
+            return "Smart plug unavailable: \(reason)"
         case .operationTimedOut(let operation):
-            return "操作超时：\(operation)"
+            return "Operation timed out: \(operation)"
         case .monitorUnavailable:
-            return "MSI 显示器 HID 控制接口不可用"
+            return "MSI display HID interface unavailable."
         case .operationFailed(let reason):
-            return "操作失败：\(reason)"
+            return "Operation failed: \(reason)"
         case .alreadyBusy:
-            return "已有恢复任务在执行中"
+            return "Another action is running."
         }
     }
 }

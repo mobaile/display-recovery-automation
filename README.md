@@ -1,115 +1,126 @@
-# 双显示器自动恢复
+# ScreenPilot 显示控制工具
 
-原生 macOS 菜单栏 App 与 CLI，针对 ANT ANT27VU 和 MSI MPG 274U E16M 的显示枚举异常，通过已验证的插座断电与 MSI 双模式切换流程恢复双屏。要求 macOS 13 或更高版本。
+ScreenPilot 是一款专为双显示器（ANT ANT27VU 与 MSI MPG 274U E16M）环境开发的原生 macOS 菜单栏控制台与 CLI 工具。通过精准的手动操作与硬件通信，用户可按需控制智能插座电源与显示器硬件显示模式。系统要求 macOS 13 或更高版本。
 
-## 恢复规则
+## 核心设计与交互定位
 
-所有已接管的恢复最终都要回到 MSI 4K。过程中允许临时进入 1080P；成功必须同时满足：两台目标显示器在线且身份明确、MSI HID 读回 UHD、系统显示 MSI 为 4K，并连续稳定 10 秒。旧缓存、缺失模式或 HID 与系统读数矛盾均不能算成功。
+ScreenPilot 彻底关闭了全自动恢复、后台静默轮询、自动重试与链式自动收尾机制。
 
-无未完成恢复责任时，自动恢复保留这两种手动选择：
+用户登录 macOS 系统后，程序会自动启动并常驻菜单栏，但绝不主动操作任何显示设备。每一次硬件动作均由用户明确点击或运行命令触发；每个动作只执行自己单一的职责并核验结果，执行完成后静默等待下一次用户指令。在动作执行期间，用户可随时点击停止（Stop）终止操作，停止后程序立即恢复就绪，不追加任何设备收尾动作。
 
-- 双屏正常在线，用户手动使用 MSI 1080P。
-- ANT 插座关闭，用户单独使用 MSI 1080P。
+在信息展示方面，ScreenPilot 严格遵守技术细节隐藏规范：面向用户的普通界面与常规日志中，严禁暴露进程互斥锁、事务标识、内部枚举原始值、协议型号编码、端口号与权限数值等底层实现细节；设备密码与 Token 绝不进入日志与普通界面。界面统一使用清晰简明的英文提示（例如 Ready、Running Turn On...、Success: Power is on. 等），便于专业工具定位。
 
-插座通信失败表示状态未知，不能当作插座关闭或开启。程序自己关闭的供电、自己留下的临时模式，会通过事务记录与手动选择区分。
+## 界面与功能
 
-## 恢复流程
+ScreenPilot 采用纯原生 AppKit 技术开发，无多余第三方 GUI 依赖。
 
-- **只有 ANT 在线：** 同一单屏拓扑稳定 5 秒后，先登记恢复责任，关闭 ANT 插座并确认 ANT 离线；等待 MSI 枚举，重新开启 ANT 插座；给 ANT 最多 10 秒自然上线。自然恢复双屏后直接进入 4K 收尾；仍确认只有 MSI 在线才使用临时 1080P。
-- **只有 MSI 在线：** 确认 ANT 插座开启、MSI HID 就绪、目标身份未变化，临时切换 FHD，等待双屏，然后切回 UHD 并验证系统 4K。即使 FHD 阶段等待双屏超时，也要继续进入统一 4K 收尾并完整核验；有些重新枚举会在回切 UHD 后才完成。最终仍缺屏时报告失败。
-- **失败、取消、正常退出：** 独立尝试恢复供电和 MSI 4K，每项收尾最多一次写入、各 5 秒总预算。收尾失败会保留责任和具体错误，不会退回 FHD 并宣布完成。
-- **重启：** 优先接续未完成收尾，不重发关电或 FHD 起始动作，不重置收尾额度。旧记录缺少目标绑定时阻止自动控制，保留记录供核对。
+### 菜单栏入口
 
-同一故障最多尝试三次，冷却从每次结束开始计算 30 秒。未完成收尾也会停止新的恢复动作，后续仅按冷却间隔核查和接续尚未使用的收尾额度。重启、保存配置和短暂双屏上线都不清零。双屏和 MSI 4K 持续健康 10 秒，或用户明确重新授权，才能解除停止。
+程序常驻于 macOS 系统状态栏，菜单项精简为以下三项：
 
-启动、系统唤醒和非恢复期间的模式变化有 10 秒观察期。同一单屏观察窗口会在拓扑换边、歧义、休眠或观测中断时重新开始。时间判断使用单调时钟，系统时间修改不影响运行中的期限。
+1. Open ScreenPilot…：打开主控制台窗口。
+2. Settings…：打开设备与网络设置窗口。
+3. Quit ScreenPilot：安全退出应用程序。
 
-## 目标、互斥与持久化
+### 主控制台窗口
 
-通过配置的完整指纹识别显示器，排除内置屏。MSI 别名只能使用明确登记的完整指纹；不会用“同厂商”绕过序列号，不会将任意非 MSI 显示器认作 ANT。
+主窗口包含状态区、动作区与执行日志区三个核心部分，窗口具备显示器断开防跑位保护机制：
 
-App 自动恢复、手动恢复、重启收尾、CLI 恢复和插座写命令共用进程锁：
+1. 状态区（Status Section）：
+   - 实时展示当前操作状态（就绪、执行中、成功或失败说明）。
+   - 被动展示当前系统识别到的显示器拓扑与模式信息。
+   - 显示 ANT 与 MSI 角色当前绑定的显示器名称。
 
-```text
-~/Library/Application Support/DisplayRecoveryAutomation/recovery.lock
-```
+2. 动作区（Actions Section）：
+   - ANT 显示器控制：
+     - Turn Off：关闭 ANT 显示器智能插座电源，并回读核验已处于关闭状态。
+     - Turn On：开启 ANT 显示器智能插座电源，并回读核验已处于开启状态。
+   - MSI 显示器控制：
+     - Lower Resolution：通过 USB HID 接口将 MSI 显示器切换为 FHD 硬件模式，并核验硬件寄存器。
+     - Restore Full Resolution：通过 USB HID 接口将 MSI 显示器恢复为 UHD 硬件模式，并核验硬件寄存器。
+   - 检测与核验：
+     - Check Status：全面检查并输出当前显示器枚举、插座通信与 HID 连接状态。
+     - Verify Both Screens：核验双显示器是否全部在线，并检测模式是否满足 4K 且持续稳定 10 秒。
+   - 停止按钮：
+     - Stop：在任何耗时动作执行期间保持高亮可用，点击后立刻取消执行，不追加任何重试或收尾写操作。
 
-HID 查询也会发送 USB 报告，因此需要取得同一锁；锁忙时 CLI 只展示持久化状态。锁覆盖整个恢复与异常收尾，忙状态不会消耗恢复次数。
+3. 执行日志区（Execution Log Section）：
+   - 保留最近 500 条操作记录，支持实时增量滚动跟随（用户向上翻阅时自动暂停滚动，回到底部恢复跟随）。
+   - 提供 Copy Log（复制到剪贴板）与 Export Log（导出脱敏日志文件）功能，日志中的 IP 地址与 Token 自动完成脱敏屏蔽。
 
-同目录中的文件：
+### 设置窗口
 
-| 文件 | 用途 |
-| --- | --- |
-| `config.json` | 版本化角色、插座和恢复配置，不含 Token |
-| `secrets.json` | 本地 Token，原子写入且权限为 0600 |
-| `recovery-transaction.json` | 第 2 版事务，保存阶段、目标绑定、失败次数、停止状态和收尾额度 |
+独立的原生设置窗口提供以下配置项：
 
-关键事务必须落盘成功才能操作硬件；读取损坏记录会报错，不会当作空记录重新计数。完成记录提交成功后才清零。事务绑定固定角色和控制配置的不可逆指纹，不能借后来更换的目标或凭据处理旧责任。
+1. Network Address：智能插座的局域网 IP 地址。
+2. Access Key：32 位十六进制设备访问密钥，支持从 macOS Keychain 安全导入历史凭据；留空保存时自动保持原有密钥不变。
+3. Display Assignment：分别从当前检测到的显示器下拉列表中选择绑定的 ANT 显示器与 MSI 显示器。
+4. 保存保护：保存失败时保留用户输入草稿，不清除用户已录入的内容。保存时强制写入自动恢复禁用标记，杜绝后台恢复逻辑激活。
 
-普通凭据读取不访问 Keychain。只有用户点击“从 Keychain 导入”才会读取历史凭据，导入后保留 Keychain 原件。设置保存失败时保留草稿；恢复进行中或存在未完成责任时不能替换目标和凭据。关闭自动恢复会取消当前恢复并执行有限收尾。
+## 命令行工具（CLI）
 
-## 构建与使用
+项目提供配套命令行工具 `display-recovery-cli`，用于脚本调度与终端诊断：
 
 ```sh
+# 显示当前连接的显示器信息
+./dist/display-recovery-cli displays
+
+# 查询整体状态（显示器、HID 与插座）
+./dist/display-recovery-cli status
+
+# 硬件诊断分析
+./dist/display-recovery-cli diagnose
+
+# 检查 MSI HID 硬件通信与寄存器状态
+./dist/display-recovery-cli hid-status
+
+# 查询智能插座当前硬件信息与开关状态
+./dist/display-recovery-cli plug-info
+
+# 手动开启插座电源（接入 ManualActionRunner 统一执行）
+./dist/display-recovery-cli plug-on
+
+# 手动关闭插座电源（接入 ManualActionRunner 统一执行）
+./dist/display-recovery-cli plug-off
+
+# 导出脱敏后的日志至文本文件
+./dist/display-recovery-cli export-log
+```
+
+注意：原有的 `recover` 与 `recover --dry-run` 自动恢复命令已在 ScreenPilot 中完全屏蔽。若用户调用该命令，CLI 会明确返回错误提示并以退出码 1 退出，引导用户使用手动动作或图形界面。
+
+## 构建与测试
+
+项目使用 Swift 构建与测试，环境要求配置 Xcode 15+（推荐 Xcode-beta）：
+
+```sh
+# 运行全量严格并发测试（84 个用例全部通过）
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun swift test -Xswiftc -strict-concurrency=complete
+
+# 执行构建并产出 App 与 CLI
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer ./scripts/build.sh
 ```
 
-产物是 `dist/DisplayRecoveryAutomation.app` 和 `dist/display-recovery-cli`。项目仍使用 Swift 5 语言兼容模式，通过完整并发检查验证；miIO 协议规定使用 MD5/AES，相关兼容实现保留协议算法。
+构建脚本将产物输出至：
+- `dist/ScreenPilot.app`（包含 ad-hoc 临时签名）
+- `dist/display-recovery-cli`
 
-```sh
-dist/display-recovery-cli displays
-dist/display-recovery-cli status
-dist/display-recovery-cli diagnose
-dist/display-recovery-cli hid-status
-dist/display-recovery-cli plug-info
-dist/display-recovery-cli recover --dry-run
-dist/display-recovery-cli recover
-dist/display-recovery-cli plug-on
-dist/display-recovery-cli plug-off
-dist/display-recovery-cli export-log
+## 系统安装与开机自启
+
+ScreenPilot 的固定系统安装位置为：
+
+```text
+/Applications/ScreenPilot.app
 ```
 
-`recover --dry-run` 与恢复入口共用预检查，只读取状态，不写硬件、事务或恢复次数。真实 `recover` 会等待终态；失败、停止和忙返回非零，取消返回 130。CLI 接收 SIGINT/SIGTERM 后执行有限收尾再退出。SIGKILL 或断电无法执行即时收尾，由下次启动读取持久化责任。
+安装部署及更新步骤如下：
 
-日志位于 `~/Library/Logs/DisplayRecoveryAutomation/recovery.log`。记录事务、阶段、尝试次数与收尾责任，写入前脱敏 IP 和 Token，合并重复消息，超过 2 MB 轮转；导出包含当前和上一份日志。
-
-## 登录后自动恢复
-
-日常运行的固定安装位置是 `/Applications/DisplayRecoveryAutomation.app`。macOS 原生登录项指向这个安装包；`dist/` 保留构建产物，更新后需要同步安装包。
-
-自动恢复需要同时启用两项设置：
-
-1. 在 macOS「系统设置 → 通用 → 登录项与扩展 → 登录时打开」中登记上述固定路径，同一路径只保留一条，移除本项目旧 `dist/` 路径的登录项。
-2. 在应用菜单栏「双屏」中勾选「自动恢复」。该开关会保存到 `~/Library/Application Support/DisplayRecoveryAutomation/config.json` 的 `recovery.automaticRecoveryEnabled`。
-
-登录 macOS 后，应用自动在菜单栏运行，先经过 10 秒启动观察期；确认同一单屏状态持续 5 秒、目标身份和设备通信满足预检查后，按现有规则尝试恢复。设备就绪和通信耗时可能延长等待，不能将 15 秒理解为恢复完成期限。睡眠唤醒后同样重新观察，正常双屏保留用户手动模式。同一故障仍最多尝试三次，每次结束后冷却 30 秒；恢复成功仍须确认双屏在线、MSI 硬件 UHD、系统 4K，并连续稳定 10 秒。
-
-该设置从用户登录后生效，不覆盖 FileVault 解锁前。2026-09-08 已在本机完成安装、唯一登录项登记和自动恢复启用；配置与运行检查见 [验收记录](docs/verification-20260908.md)。
-
-### 验证与关闭
-
-以下只读检查的预期输出分别为 `1` 和 `true`：
-
-```sh
-/usr/bin/osascript -e 'tell application "System Events" to count (every login item whose path is "/Applications/DisplayRecoveryAutomation.app")'
-/usr/bin/plutil -extract recovery.automaticRecoveryEnabled raw -o - "$HOME/Library/Application Support/DisplayRecoveryAutomation/config.json"
-```
-
-同时核对进程只运行一份，且可执行文件位于 `/Applications/DisplayRecoveryAutomation.app/Contents/MacOS/DisplayRecoveryApp`。应用启动日志和后续观测位于前述 `recovery.log`。手动启动验证只能证明安装包可以运行，真实登录自启动应在下一次正常登录时结合进程启动时间及日志核实。
-
-关闭「自动恢复」会停止新恢复并取消当前恢复、执行有限收尾；从系统登录项移除应用会停止后续登录自启动，但不会退出已运行的实例。菜单栏「退出」只结束本次运行，下次登录仍会按已登记的登录项启动。彻底停用时应关闭自动恢复、移除登录项，再正常退出。
-
-### 更新安装包
-
-按前述构建命令生成并校验新的 `dist/DisplayRecoveryAutomation.app`。确认当前没有未完成恢复责任后，通过菜单栏正常退出旧实例，备份并完整替换 `/Applications/DisplayRecoveryAutomation.app`，然后从固定安装路径重新启动。更新失败时恢复旧安装包。
-
-应用配置、凭据与恢复事务保存在用户的 Application Support 目录，更新时保留这些文件。安装路径不变时沿用原登录项，更新后再次核对唯一登录项、自动恢复开关和实际进程路径，避免继续运行旧版本或同时启动 `dist/` 里的副本。
-
-## 验证范围
-
-本次修复的测试结果、实机经过及未覆盖情形见 [2026-09-08 验收记录](docs/verification-20260908.md)。
-
-自动化测试覆盖恢复正向流程、两种手动 1080P 例外、观测过期和身份歧义、落盘失败、重启接续、三次停止、独立收尾、进程互斥及取消。插座测试使用仅绑定 127.0.0.1 的模拟器，包含已执行命令但应答丢失、静默设备与取消，不控制真实插座。
-
-诊断和 dry-run 只证明预检查可运行。真实恢复验收必须另行记录：初始拓扑、实际执行的电源/模式动作、最终 HID UHD 和系统 4K、双屏持续稳定的证据。软件不能保证修复 macOS 驱动、线缆或显示器本身的故障；不能确认 4K 时会保留未完成责任。
+1. 退出正在运行的 ScreenPilot 实例。
+2. 将构建生成的 `dist/ScreenPilot.app` 复制到 `/Applications/ScreenPilot.app`。
+3. 执行代码签名校验：
+   ```sh
+   codesign --force --deep --sign - /Applications/ScreenPilot.app
+   codesign --verify --deep --strict /Applications/ScreenPilot.app
+   ```
+4. 在 macOS「系统设置 → 通用 → 登录项与扩展 → 登录时打开」中确保仅登记一条 `/Applications/ScreenPilot.app`（可通过系统事件脚本自动维护唯一性）。
+5. 启动应用后，程序将在后台就绪，通过顶部菜单栏图标随时提供手动控制。

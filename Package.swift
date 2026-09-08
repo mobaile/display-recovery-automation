@@ -81,6 +81,15 @@ let package = Package(
         .testTarget(
             name: "DisplayRecoveryPlatformTests",
             dependencies: ["DisplayRecoveryCore", "MsiHid", "MiotLocal", "DisplayRecoveryMac"]
+        ),
+        .testTarget(
+            name: "DisplayRecoveryAppTests",
+            dependencies: [
+                "DisplayRecoveryApp",
+                "DisplayRecoveryCore",
+                "DisplayRecoveryMac",
+                "MsiHid"
+            ]
         )
     ],
     swiftLanguageModes: [.v5]
