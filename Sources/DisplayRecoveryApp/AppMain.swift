@@ -140,7 +140,6 @@ private final class ScreenPilotWindowController: NSWindowController, NSWindowDel
     private let model: AppModel
 
     // 1. 状态区
-    private let statusMessageLabel = NSTextField(labelWithString: "Ready")
     private let displaySummaryLabel = NSTextField(labelWithString: "")
     private let rolesLabel = NSTextField(labelWithString: "")
 
@@ -242,18 +241,6 @@ private final class ScreenPilotWindowController: NSWindowController, NSWindowDel
     }
 
     func refresh() {
-        // 更新状态提示
-        statusMessageLabel.stringValue = model.statusMessage
-        if model.isBusy {
-            statusMessageLabel.textColor = .systemBlue
-        } else if model.lastActionResult?.outcome == .failed {
-            statusMessageLabel.textColor = .systemRed
-        } else if model.lastActionResult?.outcome == .succeeded {
-            statusMessageLabel.textColor = .systemGreen
-        } else {
-            statusMessageLabel.textColor = .labelColor
-        }
-
         // 显示器摘要
         if model.snapshots.isEmpty {
             displaySummaryLabel.stringValue = "Displays: No active displays detected."
@@ -353,9 +340,6 @@ private final class ScreenPilotWindowController: NSWindowController, NSWindowDel
         let appTitle = NSTextField(labelWithString: "ScreenPilot")
         appTitle.font = .systemFont(ofSize: 18, weight: .bold)
         statusBox.addArrangedSubview(appTitle)
-
-        statusMessageLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        statusBox.addArrangedSubview(statusMessageLabel)
 
         displaySummaryLabel.font = .systemFont(ofSize: 11)
         displaySummaryLabel.maximumNumberOfLines = 5
