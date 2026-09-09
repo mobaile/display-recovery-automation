@@ -5,7 +5,7 @@ import DisplayRecoveryMac
 
 @main
 @MainActor
-final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
+final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static func main() {
         let app = NSApplication.shared
         let delegate = DisplayRecoveryAppDelegate()
@@ -23,8 +23,14 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "ScreenPilot"
-        statusItem.button?.toolTip = "ScreenPilot Display Control"
+        if let button = statusItem.button {
+            button.title = "ScreenPilot"
+            button.toolTip = "ScreenPilot Display Control"
+            button.target = self
+            button.action = #selector(statusItemClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        menu.delegate = self
         rebuildMenu()
 
         if CommandLine.arguments.contains("--open") {
@@ -102,8 +108,28 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
 
         let quitItem = NSMenuItem(title: "Quit ScreenPilot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
+    }
 
-        statusItem.menu = menu
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        guard let event = NSApp.currentEvent else {
+            openMainWindow()
+            return
+        }
+
+        let isRightClick = event.type == .rightMouseUp ||
+            event.type == .rightMouseDown ||
+            ((event.type == .leftMouseUp || event.type == .leftMouseDown) && event.modifierFlags.contains(.control))
+
+        if isRightClick {
+            statusItem.menu = menu
+            statusItem.button?.performClick(nil)
+        } else {
+            openMainWindow()
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        statusItem.menu = nil
     }
 }
 
