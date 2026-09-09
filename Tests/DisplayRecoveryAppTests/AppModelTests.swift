@@ -161,4 +161,49 @@ final class AppModelTests: XCTestCase {
         lock.unlock()
         await model.shutdown()
     }
+
+    func testDisplayDerivedStatesUpdatesAntAndMsi() async {
+        let lock = InMemoryRecoveryTransactionLock()
+        let model = AppModel(
+            configurationStore: configStore,
+            secretsStore: secretsStore,
+            displayProvider: MacDisplayProvider(),
+            hidController: MsiHidController(),
+            logStore: logStore,
+            processLock: lock
+        )
+
+        // 初始状态应已完成推导（非空）
+        XCTAssertNotNil(model.antState)
+        XCTAssertNotNil(model.msiState)
+
+        model.updateDisplayDerivedStates()
+
+        let antMatch = DisplayRoleResolver.resolve(
+            role: .powerControlled,
+            rolesConfig: model.appConfiguration.recovery.roles,
+            snapshots: model.snapshots
+        )
+        if case .matched(let s) = antMatch, s.online {
+            XCTAssertEqual(model.antState, .on)
+        } else {
+            XCTAssertEqual(model.antState, .off)
+        }
+
+        let msiMatch = DisplayRoleResolver.resolve(
+            role: .modeSwitch,
+            rolesConfig: model.appConfiguration.recovery.roles,
+            snapshots: model.snapshots
+        )
+        if case .matched(let s) = msiMatch {
+            if s.mode?.is4K == true {
+                XCTAssertEqual(model.msiState, .fullResolution)
+            } else if s.mode?.is1080P == true {
+                XCTAssertEqual(model.msiState, .lowerResolution)
+            }
+        }
+
+        await model.shutdown()
+    }
 }
+

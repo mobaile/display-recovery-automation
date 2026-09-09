@@ -6,11 +6,25 @@ import DisplayRecoveryMac
 import MsiHid
 import MiotLocal
 
+public enum AntDisplayState: String, CaseIterable, Equatable, Sendable {
+    case on
+    case off
+    case unknown
+}
+
+public enum MsiDisplayState: String, CaseIterable, Equatable, Sendable {
+    case fullResolution
+    case lowerResolution
+    case unknown
+}
+
 @MainActor
 public final class AppModel: ObservableObject {
     @Published public private(set) var appConfiguration: AppConfiguration
     @Published public private(set) var tokenConfigured: Bool
     @Published public private(set) var snapshots: [DisplaySnapshot] = []
+    @Published public private(set) var antState: AntDisplayState = .unknown
+    @Published public private(set) var msiState: MsiDisplayState = .unknown
     @Published public private(set) var currentAction: ManualAction?
     @Published public private(set) var lastActionResult: ManualActionResult?
     @Published public private(set) var isBusy: Bool = false
@@ -96,6 +110,9 @@ public final class AppModel: ObservableObject {
 
         rebuildRunner()
         refreshSnapshots()
+        Task { @MainActor [weak self] in
+            await self?.syncDeviceStates()
+        }
 
         displayProvider.startObserving { [weak self] in
             Task { @MainActor [weak self] in
@@ -115,9 +132,69 @@ public final class AppModel: ObservableObject {
             notifications.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     self?.refreshSnapshots()
+                    await self?.syncDeviceStates()
                 }
             }
         )
+    }
+
+    public func updateDisplayDerivedStates() {
+        // 1. MSI display state
+        let msiMatch = DisplayRoleResolver.resolve(role: .modeSwitch, rolesConfig: appConfiguration.recovery.roles, snapshots: snapshots)
+        if case .matched(let s) = msiMatch {
+            if s.mode?.is4K == true {
+                msiState = .fullResolution
+            } else if s.mode?.is1080P == true {
+                msiState = .lowerResolution
+            } else {
+                let hw = hidController.cachedStatus()
+                if hw.mode == .uhd {
+                    msiState = .fullResolution
+                } else if hw.mode == .fhd {
+                    msiState = .lowerResolution
+                } else {
+                    msiState = .unknown
+                }
+            }
+        } else {
+            let hw = hidController.cachedStatus()
+            if hw.mode == .uhd {
+                msiState = .fullResolution
+            } else if hw.mode == .fhd {
+                msiState = .lowerResolution
+            } else {
+                msiState = .unknown
+            }
+        }
+
+        // 2. ANT display state
+        let antMatch = DisplayRoleResolver.resolve(role: .powerControlled, rolesConfig: appConfiguration.recovery.roles, snapshots: snapshots)
+        if case .matched(let s) = antMatch, s.online {
+            antState = .on
+        } else if case .notFound = antMatch {
+            antState = .off
+        }
+    }
+
+    public func syncDeviceStates() async {
+        guard !terminating else { return }
+        updateDisplayDerivedStates()
+
+        if tokenConfigured, let io = platformIO {
+            if let plugPower = try? await io.readPlugPower(deadline: RecoveryDeadline(seconds: 3)) {
+                antState = plugPower ? .on : .off
+            }
+        }
+
+        if let io = platformIO {
+            if let hw = try? await io.readHardwareMode(deadline: RecoveryDeadline(seconds: 3)) {
+                if hw.mode == .uhd {
+                    msiState = .fullResolution
+                } else if hw.mode == .fhd {
+                    msiState = .lowerResolution
+                }
+            }
+        }
     }
 
     public func refreshSnapshots() {
@@ -127,6 +204,7 @@ public final class AppModel: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+        updateDisplayDerivedStates()
     }
 
     public func execute(_ action: ManualAction) {
@@ -146,7 +224,22 @@ public final class AppModel: ObservableObject {
             if result.outcome == .failed {
                 self.lastError = result.shortMessage
             }
+            if result.outcome == .succeeded {
+                switch action {
+                case .powerOff:
+                    self.antState = .off
+                case .powerOn:
+                    self.antState = .on
+                case .lowerResolution:
+                    self.msiState = .lowerResolution
+                case .restoreFullResolution:
+                    self.msiState = .fullResolution
+                case .checkStatus, .verifyBothScreens:
+                    break
+                }
+            }
             self.refreshSnapshots()
+            await self.syncDeviceStates()
         }
     }
 

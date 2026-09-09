@@ -27,11 +27,20 @@ final class DisplayRecoveryAppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "ScreenPilot Display Control"
         rebuildMenu()
 
+        if CommandLine.arguments.contains("--open") {
+            openMainWindow()
+        }
+
         observation = model.objectWillChange.sink { [weak self] _ in
             Task { @MainActor in
                 self?.mainWindowController?.refresh()
             }
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openMainWindow()
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -181,6 +190,9 @@ private final class ScreenPilotWindowController: NSWindowController, NSWindowDel
         super.showWindow(sender)
         ensureWindowOnAvailableScreen()
         refresh()
+        Task { [weak self] in
+            await self?.model.syncDeviceStates()
+        }
     }
 
     private func ensureWindowOnAvailableScreen() {
@@ -231,12 +243,36 @@ private final class ScreenPilotWindowController: NSWindowController, NSWindowDel
 
         rolesLabel.stringValue = "ANT display: \(model.roleName(.powerControlled))   |   MSI display: \(model.roleName(.modeSwitch))"
 
-        // 按钮启用状态
+        // 按钮启用与状态呈现
         let busy = model.isBusy
-        turnOffButton.isEnabled = !busy
-        turnOnButton.isEnabled = !busy
-        lowerResButton.isEnabled = !busy
-        restoreFullResButton.isEnabled = !busy
+
+        // 1. ANT display 状态表现
+        switch model.antState {
+        case .on:
+            applyStatusStyle(to: turnOnButton, isActive: true, isBusy: busy)
+            applyStatusStyle(to: turnOffButton, isActive: false, isBusy: busy)
+        case .off:
+            applyStatusStyle(to: turnOffButton, isActive: true, isBusy: busy)
+            applyStatusStyle(to: turnOnButton, isActive: false, isBusy: busy)
+        case .unknown:
+            applyStatusStyle(to: turnOnButton, isActive: false, isBusy: busy)
+            applyStatusStyle(to: turnOffButton, isActive: false, isBusy: busy)
+        }
+
+        // 2. MSI display 状态表现
+        switch model.msiState {
+        case .fullResolution:
+            applyStatusStyle(to: restoreFullResButton, isActive: true, isBusy: busy)
+            applyStatusStyle(to: lowerResButton, isActive: false, isBusy: busy)
+        case .lowerResolution:
+            applyStatusStyle(to: lowerResButton, isActive: true, isBusy: busy)
+            applyStatusStyle(to: restoreFullResButton, isActive: false, isBusy: busy)
+        case .unknown:
+            applyStatusStyle(to: restoreFullResButton, isActive: false, isBusy: busy)
+            applyStatusStyle(to: lowerResButton, isActive: false, isBusy: busy)
+        }
+
+        // 3. Inspection 与辅助按钮
         checkStatusButton.isEnabled = !busy
         verifyBothScreensButton.isEnabled = !busy
 
@@ -245,6 +281,18 @@ private final class ScreenPilotWindowController: NSWindowController, NSWindowDel
 
         // 更新日志视图
         updateLogText()
+    }
+
+    private func applyStatusStyle(to button: NSButton, isActive: Bool, isBusy: Bool) {
+        if isActive {
+            button.bezelColor = .systemGreen
+            button.isEnabled = false
+            button.toolTip = "当前生效状态"
+        } else {
+            button.bezelColor = nil
+            button.isEnabled = !isBusy
+            button.toolTip = nil
+        }
     }
 
     private func updateLogText() {
@@ -403,18 +451,22 @@ private final class ScreenPilotWindowController: NSWindowController, NSWindowDel
     // MARK: - Button Actions
 
     @objc private func turnOffClicked() {
+        guard model.antState != .off else { return }
         model.execute(.powerOff)
     }
 
     @objc private func turnOnClicked() {
+        guard model.antState != .on else { return }
         model.execute(.powerOn)
     }
 
     @objc private func lowerResClicked() {
+        guard model.msiState != .lowerResolution else { return }
         model.execute(.lowerResolution)
     }
 
     @objc private func restoreFullResClicked() {
+        guard model.msiState != .fullResolution else { return }
         model.execute(.restoreFullResolution)
     }
 
